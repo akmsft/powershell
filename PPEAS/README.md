@@ -78,7 +78,7 @@ The app must have permission to read Dataverse metadata:
 1. In the app registration, select **API permissions** (left sidebar)
 2. Click **+ Add a permission**
 3. Click **APIs my organization uses** (tab at the top)
-4. Search for `Dynamics CRM` and select it from the results
+4. Search for `Dynamics CRM` (if not found, search for `Dataverse`) and select it from the results
 5. On the "Request API permissions" screen, choose your permission type based on your authentication method:
    - **For app-only authentication (client secret or certificate)**: 
      - Select **Application permissions**
