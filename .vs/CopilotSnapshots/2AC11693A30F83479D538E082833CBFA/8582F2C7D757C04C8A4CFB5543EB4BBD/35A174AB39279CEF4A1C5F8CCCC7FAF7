@@ -641,312 +641,212 @@ function Get-DvToken {
 
 
 
-
-# =======================================================================================
-# MAIN EXECUTION
-# =======================================================================================
-
-Write-Host ""
-Write-Host "╔════════════════════════════════════════════════════════════════════════════╗"
-Write-Host "║     Dataverse Audited Attributes Export                                    ║"
-Write-Host "║     Script Version: 2.0                                                    ║"
-Write-Host "╚════════════════════════════════════════════════════════════════════════════╝"
-Write-Host ""
-
-# STEP 1: Detect cloud environment and get authentication endpoints
-Write-Host "[STEP 1/6] Detecting cloud environment..."
+# -------------------------
+# Main
+# -------------------------
 $envInfo = Get-EnvironmentInfo -OrgUrl $OrgUrl
 $AzEnvironment = $envInfo.AzEnvironment
-$ResourceUrl = $envInfo.ResourceUrl
-$LoginHost = $envInfo.LoginHost
-
-Write-Host "  Detected cloud: $($envInfo.Cloud)"
-Write-Host "  Azure environment: $AzEnvironment"
-Write-Host "  Dataverse resource: $ResourceUrl"
-
+$ResourceUrl   = $envInfo.ResourceUrl
+$LoginHost     = $envInfo.LoginHost
 if ($envInfo.ContainsKey('Supported') -and -not $envInfo.Supported) {
-    Write-Error "ERROR: Your organization URL appears to be in the '$($envInfo.Cloud)' cloud, which is not supported."
-    Write-Error "Please use a supported cloud (Commercial, GCCH, or GCC) or update the script."
+    Write-Error "The organization URL you provided appears to be in the '$($envInfo.Cloud)' cloud. This script is not designed to run against that cloud. Please use a supported cloud (Commercial or GCCH) or update the script to handle your environment."
     exit 1
 }
 
-# STEP 2: Authenticate and acquire access token
-Write-Host ""
-Write-Host "[STEP 2/6] Authenticating to Azure AD..."
+# Acquire token (try resource base first, fallback to org URL resource if server returns 401)
 $useOrgFallback = $false
-try {
-    $token = Get-DvToken -Auth $Auth -TenantId $TenantId -ClientId $ClientId `
-        -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint `
-        -AzEnvironment $AzEnvironment -ResourceUrl $ResourceUrl -LoginHost $LoginHost `
-        -OrgUrl $OrgUrl -UseOrgResource:$useOrgFallback
-} catch {
-    Write-Error "Failed to authenticate: $($_.Exception.Message)"
-    exit 1
-}
-
-# Set up headers for API calls
+$token = Get-DvToken -Auth $Auth -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint -AzEnvironment $AzEnvironment -ResourceUrl $ResourceUrl -LoginHost $LoginHost -OrgUrl $OrgUrl -UseOrgResource:$useOrgFallback
 $base = "$OrgUrl/api/data/v9.2"
 $hdrs = @{ Authorization = "Bearer $token"; Accept = "application/json" }
 
-# Display token diagnostics
-Write-Host ""
-Write-Host "[STEP 2a] Token Diagnostics:"
+# Quick token diagnostic
 $claims = Decode-JwtPayload -jwt $token
 if ($claims) {
-    Write-Host "  ✓ Token audience (aud): $($claims.aud)"
-    if ($claims.roles) { Write-Host "  ✓ Roles: $($claims.roles -join ', ')" }
-    if ($claims.scp) { Write-Host "  ✓ Scopes: $($claims.scp)" }
-    
-    $expiryTime = [DateTimeOffset]::FromUnixTimeSeconds([int]$claims.exp).ToLocalTime()
-    $timeRemaining = $expiryTime - (Get-Date)
-    Write-Host "  ✓ Token expires: $expiryTime ($($timeRemaining.TotalMinutes.ToString('F0')) minutes remaining)"
+    Write-Host "Token audience (aud): $($claims.aud)"
+    if ($claims.roles) { Write-Host "Roles: $($claims.roles -join ', ')" }
+    if ($claims.scp)   { Write-Host "Scopes: $($claims.scp)" }
+    Write-Host ("Token expires: {0}" -f ([DateTimeOffset]::FromUnixTimeSeconds([int]$claims.exp).ToLocalTime()))
 } else {
-    Write-Warning "  ⚠ Unable to decode token payload (token may not be a JWT)"
+    Write-Warning "Unable to decode token payload for diagnostics."
 }
 
-# STEP 3: Validate token by making a test API call
-Write-Host ""
-Write-Host "[STEP 3/6] Validating token with test API call..."
+# Test token with a simple API call and fallback if 401 (try acquiring token using the org URL as resource)
 try {
-    $whoAmI = Invoke-Dataverse -Method Get -Uri "$base/WhoAmI" -Headers $hdrs | Out-Null
-    Write-Host "  ✓ Token validated successfully"
+    Invoke-Dataverse -Method Get -Uri "$base/WhoAmI" -Headers $hdrs | Out-Null
 } catch {
     $err = $_
     $is401 = $false
-    try { $is401 = ($err.Exception.Response.StatusCode -eq 401) } catch { }
-    
+    try { $is401 = ($err.Exception.Response.StatusCode -eq 401) } catch {}
     if ($is401 -and -not $useOrgFallback) {
-        Write-Warning "  ⚠ Initial token failed (401 Unauthorized). Retrying with org URL as resource..."
+        Write-Warning "API returned 401 Unauthorized with token for resource '$ResourceUrl'. Retrying token acquisition using the org URL as resource..."
         $useOrgFallback = $true
+        $token = Get-DvToken -Auth $Auth -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint -AzEnvironment $AzEnvironment -ResourceUrl $ResourceUrl -LoginHost $LoginHost -OrgUrl $OrgUrl -UseOrgResource:$useOrgFallback
+        $hdrs = @{ Authorization = "Bearer $token"; Accept = "application/json" }
+        $claims = Decode-JwtPayload -jwt $token
+        if ($claims) { Write-Host "New token audience (aud): $($claims.aud)" }
         try {
-            $token = Get-DvToken -Auth $Auth -TenantId $TenantId -ClientId $ClientId `
-                -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint `
-                -AzEnvironment $AzEnvironment -ResourceUrl $ResourceUrl -LoginHost $LoginHost `
-                -OrgUrl $OrgUrl -UseOrgResource:$useOrgFallback
-            $hdrs = @{ Authorization = "Bearer $token"; Accept = "application/json" }
-            $claims = Decode-JwtPayload -jwt $token
-            if ($claims) { Write-Host "  ✓ New token audience: $($claims.aud)" }
-            
-            # Re-test with new token
             Invoke-Dataverse -Method Get -Uri "$base/WhoAmI" -Headers $hdrs | Out-Null
-            Write-Host "  ✓ Token validated successfully (with fallback)"
         } catch {
-            Write-Error "Failed even after fallback: $($_.Exception.Message)"
-            exit 1
+            throw "API still returned error after reacquiring token with org resource: $($_.Exception.Message)"
         }
     } else {
-        Write-Error "Token validation failed: $($_.Exception.Message)"
-        exit 1
+        throw "API returned error when testing token: $($_.Exception.Message)"
     }
 }
 
-# STEP 4: Validate and prepare output directory
-Write-Host ""
-Write-Host "[STEP 4/6] Preparing output directory..."
+# If we reach here the token is valid for API calls
+Write-Host "Token validated for Dataverse Web API."
 
-# Normalize path (handle relative paths)
+# Ensure output dir exists and is writable (normalize relative paths)
 if ([string]::IsNullOrWhiteSpace($OutDir)) { $OutDir = $PSScriptRoot }
+
 if (-not [IO.Path]::IsPathRooted($OutDir)) {
     $OutDir = Join-Path -Path $PSScriptRoot -ChildPath $OutDir
 }
 
-# Create or validate directory
+# If path exists, ensure it's a directory. If it doesn't, create it.
 if (Test-Path -LiteralPath $OutDir) {
     try {
-        $item = Get-Item -LiteralPath $OutDir -ErrorAction Stop
-        if (-not $item.PSIsContainer) {
-            throw "Path '$OutDir' exists but is not a directory."
+        $it = Get-Item -LiteralPath $OutDir -ErrorAction Stop
+        if (-not $it.PSIsContainer) {
+            throw "Path '$OutDir' exists but is not a directory. Remove or choose a different OutDir."
         }
     } catch {
-        Write-Error "Cannot validate output directory: $($_.Exception.Message)"
-        exit 1
+        throw "Unable to validate existing output path '$OutDir': $($_.Exception.Message)"
     }
 } else {
     try {
         New-Item -ItemType Directory -Path $OutDir -ErrorAction Stop | Out-Null
-        Write-Host "  Created output directory: $OutDir"
     } catch {
-        Write-Error "Failed to create output directory '$OutDir': $($_.Exception.Message)"
-        exit 1
+        throw "Unable to create output directory '$OutDir': $($_.Exception.Message)"
     }
 }
 
-# Test write access
-$testFile = Join-Path $OutDir (".write_test_{0}.tmp" -f [Guid]::NewGuid())
+# Quick write-check
+$testFile = Join-Path $OutDir ('.write_test_{0}.tmp' -f ([Guid]::NewGuid()))
 try {
     Set-Content -Path $testFile -Value 'ok' -ErrorAction Stop
     Remove-Item -Path $testFile -ErrorAction SilentlyContinue
-    Write-Host "  ✓ Output directory is writable"
 } catch {
-    Write-Error "No write access to output directory. Error: $($_.Exception.Message)"
-    exit 1
+    throw "No write access to output directory '$OutDir'. Change `\$OutDir` to a writable location or fix permissions. Error: $($_.Exception.Message)"
 }
 
-# STEP 5a: Retrieve organization-level audit settings (optional)
-Write-Host ""
-Write-Host "[STEP 5/6] Querying Dataverse for audited tables and attributes..."
-Write-Host "  This may take a few minutes depending on the number of tables..."
-
+# Org-level audit context (optional) with error-body diagnostics
 try {
-    Write-Host "  Retrieving organization audit settings..."
-    $orgQuery = "$base/organizations?`$select=isauditenabled,isuseraccessauditenabled,auditretentionperiodv2,auditsettings"
-    $orgResp = Invoke-Dataverse -Method Get -Uri $orgQuery -Headers $hdrs
-    if ($orgResp -and $orgResp.value) {
-        $orgResp.value | ConvertTo-Json -Depth 6 | Out-File (Join-Path $OutDir "org_audit_status.json") -Encoding UTF8
-        Write-Host "  ✓ Organization audit settings exported to org_audit_status.json"
-    }
+    $orgUrl = "$base/organizations?$select=isauditenabled,isuseraccessauditenabled,auditretentionperiodv2,auditsettings"
+    $orgResp = Invoke-Dataverse -Method Get -Uri $orgUrl -Headers $hdrs
+    $orgResp.value | ConvertTo-Json -Depth 6 | Out-File (Join-Path $OutDir "org_audit_status.json") -Encoding UTF8
 } catch {
+    $body = $null
     $status = $null
-    try { $status = [int]$_.Exception.Response.StatusCode } catch { }
-    
-    if ($status -in 400, 404) {
-        Write-Host "  ⚠ Organization audit endpoint not available (HTTP $status - this environment may not support it)"
+    try {
+        $resp = $_.Exception.Response
+        if ($resp) {
+            try { $status = [int]$resp.StatusCode } catch {}
+            try { $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch {}
+        }
+    } catch {}
+
+    # Treat 400/404 as non-fatal/unavailable (some orgs/versions may not expose this endpoint)
+    if ($status -in 400,404) {
+        Write-Host "Organization audit settings endpoint returned HTTP $status; skipping org-level audit JSON (this environment may not support that call)."
     } else {
-        Write-Warning "  ⚠ Unable to retrieve organization audit settings: $($_.Exception.Message)"
+        Write-Warning "Unable to read organization audit settings: $($_.Exception.Message)"
+        if ($body) { Write-Host "Organization API response body:`n$body" }
     }
 }
 
-# STEP 5b: Query tables with auditing enabled
-Write-Host ""
-Write-Host "  Retrieving tables with auditing enabled..."
+# Build tables filter
 $tablesFilter = "IsAuditEnabled/Value eq true"
-if ($IncludeFieldsFromAllTables) {
-    $tablesFilter = "LogicalName ne null"
-    Write-Host "  (Advanced mode: including all tables)"
-}
+if ($IncludeFieldsFromAllTables) { $tablesFilter = "LogicalName ne null" }
 
 $entitySelect = "LogicalName,SchemaName,DisplayName,EntitySetName,ObjectTypeCode,IsActivity,IsAuditEnabled"
 $tablesUrl = "$base/EntityDefinitions?`$select=$entitySelect&`$filter=$tablesFilter"
 
-try {
-    $tables = Get-AllPages -Url $tablesUrl -Headers $hdrs
-    Write-Host "  ✓ Found $($tables.Count) table(s)"
-} catch {
-    Write-Error "Failed to query tables: $($_.Exception.Message)"
-    exit 1
-}
+# Get all tables (handles paging)
+$tables = Get-AllPages -Url $tablesUrl -Headers $hdrs
 
-# STEP 5c: Process each table and collect audited attributes
-Write-Host "  Processing audited attributes..."
+# Prepare output rows
 $rows = New-Object System.Collections.Generic.List[Object]
-$processedCount = 0
 
 foreach ($t in $tables) {
-    $processedCount++
     $tableLogical = $t.LogicalName
-    $tableDisplay = if ($t.DisplayName -and $t.DisplayName.UserLocalizedLabel) {
-        $t.DisplayName.UserLocalizedLabel.Label
-    } else {
-        $null
-    }
+    $tableDisplay = if ($t.DisplayName -and $t.DisplayName.UserLocalizedLabel) { $t.DisplayName.UserLocalizedLabel.Label } else { $null }
     $tableAuditEnabled = if ($t.IsAuditEnabled) { $t.IsAuditEnabled.Value } else { $false }
-    
-    # Progress indicator every 10 tables
-    if ($processedCount % 10 -eq 0) {
-        Write-Host "    Processing table $processedCount of $($tables.Count)..."
-    }
-    
-    # Query audited attributes for this table
+
     $attrFilter = "IsAuditEnabled/Value eq true"
     $attrSelect = "LogicalName,SchemaName,AttributeType,DisplayName,IsAuditEnabled"
-    $attrUrl = "$base/EntityDefinitions(LogicalName='$tableLogical')/Attributes?`$select=$attrSelect&`$filter=$attrFilter"
-    
+    $attrUrl = "$base/EntityDefinitions(LogicalName='$($tableLogical)')/Attributes?`$select=$attrSelect&`$filter=$attrFilter"
+
     try {
         $attrs = Get-AllPages -Url $attrUrl -Headers $hdrs
-        $attrs = @($attrs)  # Ensure it's an array
-        
-        # Filter to only audited attributes (handle data type variations)
-        $auditedAttrs = @()
-        foreach ($attr in $attrs) {
-            $isAudited = $false
-            try {
-                # Try to get the Value property first (BooleanManagedProperty)
-                $raw = $attr.IsAuditEnabled.Value
-            } catch {
-                # Fall back to direct value
-                $raw = $attr.IsAuditEnabled
-            }
-            
-            # Normalize boolean values
+
+        # Normalize to an array so Count and filtering behave consistently even when a single
+        # attribute object is returned.
+        $attrs = @($attrs)
+
+        # Apply robust client-side filter to include only attributes with auditing enabled.
+        # Some endpoints return a BooleanManagedProperty object with a .Value boolean, while
+        # others may return a plain boolean. Handle both cases.
+        $attrs = $attrs | Where-Object {
+            $prop = $_.PSObject.Properties.Match('IsAuditEnabled') | Select-Object -First 1
+            if (-not $prop) { return $false }
+            try { $raw = $prop.Value.Value } catch { $raw = $prop.Value }
+
             if ($raw -is [string]) {
-                $isAudited = ($raw.Trim().ToLower() -eq 'true')
+                return ($raw.Trim().ToLower() -eq 'true')
             } elseif ($raw -is [bool]) {
-                $isAudited = $raw
+                return $raw
             } elseif ($raw -is [int] -or $raw -is [double]) {
-                $isAudited = ($raw -ne 0)
+                return ($raw -ne 0)
             }
-            
-            if ($isAudited) {
-                $auditedAttrs += $attr
-            }
+            return $false
         }
-        
-        # Add rows for each audited attribute
-        foreach ($attr in $auditedAttrs) {
-            $attrDisplay = if ($attr.DisplayName -and $attr.DisplayName.UserLocalizedLabel) {
-                $attr.DisplayName.UserLocalizedLabel.Label
-            } else {
-                $null
+    } catch {
+        Write-Warning "Failed attribute read for $($tableLogical): $($_.Exception.Message)"
+        $attrs = @()
+    }
+
+    if ($attrs.Count -eq 0) {
+        # No audited attributes for this table; skip adding a placeholder row so we don't
+        # produce rows with attribute_auditing_enabled = $false.
+        continue
+    } else {
+        foreach ($a in $attrs) {
+            $attrLogical = $a.LogicalName
+            $attrDisplay = if ($a.DisplayName -and $a.DisplayName.UserLocalizedLabel) { $a.DisplayName.UserLocalizedLabel.Label } else { $null }
+            # Normalize the IsAuditEnabled value (handle BooleanManagedProperty or plain boolean)
+            $attrAuditEnabled = $false
+            if ($a.PSObject.Properties.Match('IsAuditEnabled')) {
+                try { $raw = $a.IsAuditEnabled.Value } catch { $raw = $a.IsAuditEnabled }
+                if ($raw -is [string]) { $attrAuditEnabled = ($raw.Trim().ToLower() -eq 'true') }
+                elseif ($raw -is [bool]) { $attrAuditEnabled = $raw }
+                elseif ($raw -is [int] -or $raw -is [double]) { $attrAuditEnabled = ($raw -ne 0) }
+                else { $attrAuditEnabled = $false }
             }
-            
-            $rows.Add([PSCustomObject]@{
+
+            # Final guard: only add rows for attributes that are actually audited.
+            if (-not $attrAuditEnabled) { continue }
+
+            $rows.Add([pscustomobject]@{
                 table_logical               = $tableLogical
                 table_display               = $tableDisplay
                 table_auditing_enabled      = $tableAuditEnabled
-                attribute_logical           = $attr.LogicalName
+                attribute_logical           = $attrLogical
                 attribute_display           = $attrDisplay
-                attribute_auditing_enabled  = $true
+                attribute_auditing_enabled  = $attrAuditEnabled
             })
         }
-    } catch {
-        Write-Warning "  ⚠ Failed to query attributes for table '$tableLogical': $($_.Exception.Message)"
     }
 }
 
-Write-Host "  ✓ Collected $($rows.Count) audited attribute(s)"
-
-# STEP 6: Export results to CSV
-Write-Host ""
-Write-Host "[STEP 6/6] Exporting results to CSV..."
+# Final safety filter: ensure we only export rows where the attribute auditing flag is true
 
 $outPath = Join-Path $OutDir $OutFile
 
-try {
-    # Final filter and sort
-    $exportRows = $rows | Where-Object {
-        $_.attribute_auditing_enabled -eq $true -and -not [string]::IsNullOrWhiteSpace($_.attribute_logical)
-    } | Sort-Object table_logical, attribute_logical
-    
-    # Convert to CSV with UTF-8 encoding (no BOM)
-    $csvLines = $exportRows | ConvertTo-Csv -NoTypeInformation
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines($outPath, $csvLines, $utf8NoBom)
-    
-    Write-Host "  ✓ Exported $($exportRows.Count) row(s) to CSV"
-    Write-Host "  ✓ Output file: $outPath"
-} catch {
-    Write-Error "Failed to export CSV: $($_.Exception.Message)"
-    exit 1
-}
+$exportRows = $rows | Where-Object { $_.attribute_auditing_enabled -eq $true -and -not [string]::IsNullOrWhiteSpace($_.attribute_logical) }
+$csvLines = $exportRows | Sort-Object table_logical, attribute_logical | ConvertTo-Csv -NoTypeInformation
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllLines($outPath, $csvLines, $utf8NoBom)
 
-# Completion summary
-Write-Host ""
-Write-Host "╔════════════════════════════════════════════════════════════════════════════╗"
-Write-Host "║                       ✓ SCRIPT COMPLETED SUCCESSFULLY                     ║"
-Write-Host "╚════════════════════════════════════════════════════════════════════════════╝"
-Write-Host ""
-Write-Host "Summary:"
-Write-Host "  • Tables found: $($tables.Count)"
-Write-Host "  • Audited attributes found: $($rows.Count)"
-Write-Host "  • Output files:"
-Write-Host "      - CSV: $outPath"
-if (Test-Path (Join-Path $OutDir "org_audit_status.json")) {
-    Write-Host "      - JSON: $(Join-Path $OutDir "org_audit_status.json")"
-}
-Write-Host ""
-Write-Host "Next steps:"
-Write-Host "  1. Review the CSV file for audit coverage"
-Write-Host "  2. Verify all necessary attributes are being audited"
-Write-Host "  3. Consider enabling auditing for additional tables/attributes as needed"
-Write-Host ""
-
+Write-Host "Done -> $outPath (and org_audit_status.json if available)"

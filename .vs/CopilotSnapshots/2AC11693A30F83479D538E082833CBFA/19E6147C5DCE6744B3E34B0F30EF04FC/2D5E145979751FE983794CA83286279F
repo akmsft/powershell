@@ -1,0 +1,410 @@
+﻿# Dataverse Audited Attributes Export (PowerShell)
+
+## Overview
+
+This PowerShell script (`EnvironmentAuditingSummary.ps1`) enumerates Microsoft Dataverse tables that have auditing enabled and exports the audited attributes for each table to a CSV file. The script is designed for Power Platform administrators and security teams to inventory and review audit coverage across Dataverse environments.
+
+### Key Features
+
+- **Read-Only**: The script performs no modifications to your environment; it only queries and exports audit metadata.
+- **Multi-Cloud Support**: Automatically detects and handles commercial Azure, GCCH (US Government Cloud), and GCC (US Government) clouds.
+- **Enterprise Robustness**: Implements automatic retry logic with exponential backoff for throttled requests (HTTP 429/503), follows OData paging for large result sets, and validates token credentials before executing.
+- **Flexible Authentication**: Supports three authentication methods for different automation scenarios (user delegation, service principal with certificate, or service principal with client secret).
+- **Token Diagnostics**: Provides token inspection and audience validation to troubleshoot authentication issues.
+- **Error Handling**: Includes graceful fallback logic for token acquisition when initial authentication targets fail.
+
+## Prerequisites
+
+### Local Machine Requirements
+
+- **PowerShell Core 7.0+** (or Windows PowerShell 5.1 minimum; PowerShell Core 7+ recommended)
+- **Internet connectivity** to Azure AD and the target Dataverse environment
+- **Az.Accounts PowerShell module** — the script will automatically install this module if missing:
+
+## Azure & Power Platform Setup (Required Steps)
+Follow these steps to prepare Azure AD and the Power Platform environment so the script can read Dataverse metadata and audit settings.
+
+1. **App Registration (for non-interactive/service principal flows)**
+   - Sign in to the Azure portal (https://portal.azure.com) and open Azure Active Directory > App registrations > New registration.
+   - Name: e.g., "Dataverse Auditing Reader".
+   - Supported account types: choose the tenant scope required for your scenarios.
+   - Redirect URI: not required for client credentials; for delegated/device-code flows you can leave blank.
+   - Note the Application (client) ID and Directory (tenant) ID and record them for the script configuration.
+
+2. **Assign API Permissions**
+   - Under the app registration, open "API permissions" > "Add a permission" > "APIs my organization uses".
+   - Search for "Dynamics CRM" (or use "Power Platform"/"Dataverse") and select it.
+   - For app-only (client credentials / certificate) flows, add the application permission: `user_impersonation` (or the equivalent application-level scope for Dataverse metadata read). For delegated/device-code flows, add the delegated permission `user_impersonation`.
+   - Click "Grant admin consent" (requires an Azure AD administrator). Without admin consent, the app may not be able to acquire tokens for app-only flows.
+
+3. **Create a Client Secret (if using client credentials)**
+   - In the app registration choose "Certificates & secrets" > "New client secret".
+   - Record the secret value immediately — it will not be shown again. Use this value for `$ClientSecret`.
+   - Secrets should be stored securely (Key Vault, Azure DevOps secure variable, etc.) and not checked into source control.
+
+4. **Upload a Certificate (if using certificate auth)**
+   - Create or use an existing certificate with a private key protected in the machine/user certificate store or Azure Key Vault.
+   - In App registration > Certificates & secrets > Upload certificate: upload the public cert.
+   - Note the certificate thumbprint and provide it to the script via `$CertificateThumbprint`.
+   - Ensure the service principal has access to the cert's private key if running non-interactively from a service account or host.
+
+5. **Dataverse (Power Platform) Privileges**
+   - The app (service principal) or user must have read access to Dataverse metadata. At minimum, grant the following roles to the user or service principal within the environment:
+     - Environments > Select Environment > Settings > Users + permissions > Users: ensure the executing user/service principal is provisioned as an environment user.
+     - Assign one of: System Administrator, System Customizer, or a custom security role with at least the following privileges on the Metadata:
+       - Read access to EntityDefinitions
+       - Read access to Attribute metadata
+   - For app-only service principals, you may need to add the application user in Power Platform admin center:
+     - Admin center > Environments > Select environment > Settings > Users + permissions > Application users > New app user.
+     - Link the app user to the Azure AD app registration and assign an environment role (System Reader/Custom role with read metadata permissions).
+
+6. **Enable Auditing in the Environment (Power Platform)**
+   - Power Platform Admin Center > Environments > Select environment > Settings > Auditing.
+   - Turn on "Start recording audit logs" (organization-level auditing). Note that organization-level auditing is required for any table-level auditing to be recorded.
+   - For specific tables/entities: open Maker portal or classic solution explorer, choose the table > Settings > Auditing > enable auditing for the table and then for individual attributes as needed.
+   - Auditing changes can take effect immediately, but historical audit logs are only captured after auditing is enabled.
+
+7. **Multi-cloud Considerations**
+   - For GCC/GCCH (US Government) tenants, your organization URL will typically contain `.microsoftdynamics.us` or use instance-style hosts such as `crm9.dynamics.com`. The script attempts to detect the cloud and target the correct Azure login and Dataverse resource endpoints automatically.
+
+## What the Script Produces (Output)
+**Primary artifact**
+- **CSV file** written to a specified output directory (UTF-8, no BOM). Default filename can be customized via `$OutFile`. Columns:  
+  `table_logical`, `table_display`, `table_auditing_enabled`, `attribute_logical`, `attribute_display`, `attribute_auditing_enabled`.
+
+**Secondary artifact**
+- **Organization audit context (optional)** — the script attempts to write `org_audit_status.json` with org-level audit settings if the endpoint is available.
+
+**Sample CSV row**
+table_logical,table_display,table_auditing_enabled,attribute_logical,attribute_display,attribute_auditing_enabled
+account,Account,true,name,Account Name,true
+
+## Authentication Options
+1. **User authentication with device code** — interactive delegated auth.
+2. **App-only authentication with certificate** — non-interactive service principal.
+3. **App-only authentication with client secret** — non-interactive service principal with fallback token logic.
+
+## Running the Script
+
+### Basic Execution
+- **Device code (interactive, delegated):**
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$Auth = 'devicecode'
+pwsh -File .\Dataverse-AuditedAttributes.ps1
+```
+
+- **Client credentials (non-interactive, secret):**
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$ClientSecret = "<your-client-secret>"  # store securely
+$Auth = 'clientcredentials'
+pwsh -File .\Dataverse-AuditedAttributes.ps1
+```
+
+- **Client certificate (non-interactive, certificate):**
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$CertificateThumbprint = "<thumbprint>"
+$Auth = 'clientcertificate'
+pwsh -File .\Dataverse-AuditedAttributes.ps1
+```
+
+## Error Handling and Resilience
+- Retries 429/503 with exponential backoff
+- Follows `@odata.nextLink`
+- Token diagnostics and fallback audience logic
+
+## Troubleshooting and Common Errors
+- **401 Unauthorized during API calls:**
+  - The script includes token audience fallback logic and will retry acquiring a token targeted at the organization URL. If you still see 401, verify the app registration has proper permissions and admin consent was granted.
+  - Use device-code flow to verify interactive sign-in and inspect the acquired token payload written to `%TEMP%\dv_access_token.txt` (remove after diagnostics).
+
+- **403 Forbidden:**
+  - The authenticated principal lacks required Dataverse permissions. Ensure the app user or signed-in user has environment access and read permissions to metadata.
+
+- **Throttling (429/503):**
+  - The script automatically retries with exponential backoff. If you still encounter frequent throttling, reduce request concurrency or run during off-peak hours.
+
+## Security Considerations
+- Secrets not written to disk
+- Certificate private key must be secured
+- Device-code token written to temp for diagnostics (remove for production)
+- Do not store client secrets in source control or plaintext. Use a secure secret store (Azure Key Vault, local DPAPI-protected store, or CI/CD secure variables).
+- Certificate private keys must be protected and access-restricted. Prefer using Azure Key Vault or a secure certificate store for automation.
+- The device-code access token is written to the temporary directory for diagnostics; remove it after troubleshooting and do not use this behavior in production without modification.
+
+## Limitations
+- Read-only
+- Requires auditing enabled
+- Subject to Dataverse throttling
+
+## Output
+- **Primary artifact:** CSV file (UTF-8, no BOM) with columns:
+  `table_logical, table_display, table_auditing_enabled, attribute_logical, attribute_display, attribute_auditing_enabled`.
+- **Secondary artifact:** `org_audit_status.json` (optional) containing organization-level audit settings if the endpoint is available.
+
+## Support & Contribution
+- If you add or modify project-level policies (EditorConfig, CONTRIBUTING.md), update repository documentation accordingly.
+- For code changes, follow the project's contributing guidelines and run any automated lint or formatting checks.
+
+### Cloud Detection
+
+The script automatically detects the target Azure cloud based on the organization URL:
+
+- **Commercial Cloud** (default): `*.crm.dynamics.com` or `*.dynamics.com`
+- **GCCH (US Government)**: `*.microsoftdynamics.us` or `*.crm.microsoftdynamics.us`
+- **GCC (US Government)**: Instance-style hosts (e.g., `crm9.dynamics.com`)
+
+No manual cloud configuration is required; the script adjusts authentication endpoints and Dataverse resource URLs automatically.
+
+## Azure AD & Power Platform Setup (Required Steps)
+
+Follow these steps to prepare your Azure AD tenant and Power Platform environment for the script to authenticate and read Dataverse audit metadata.
+
+### 1. Verify Target Environment URL
+
+Before proceeding, identify your Dataverse organization URL. It typically appears as:
+- **Commercial**: `https://contoso.crm.dynamics.com`
+- **GCCH/GCC (US Government)**: `https://contoso.microsoftdynamics.us` or `https://crm9.dynamics.com`
+
+You'll need this URL for script configuration and app registration permissions.
+
+### 2. Create an Azure AD App Registration
+
+Sign in to the **Azure Portal** (https://portal.azure.com):
+
+1. Navigate to **Azure Active Directory** > **App registrations** > **+ New registration**
+2. Provide a meaningful name (e.g., `Dataverse Auditing Reader`)
+3. Select **Supported account types** appropriate for your organization:
+ - **Accounts in this organizational directory only** (single-tenant) — most secure for a single organization
+ - **Accounts in any organizational directory** (multi-tenant) — if managing multiple tenants
+4. **Redirect URI** (optional for service principals): Leave blank for non-interactive service principal flows
+5. Click **Register**
+6. On the app registration page, record the following values; you'll need them for script configuration:
+ - **Application (client) ID**
+ - **Directory (tenant) ID**
+
+### 3. Assign API Permissions
+
+1. In the app registration, select **API permissions** > **+ Add a permission**
+2. Click **APIs my organization uses** and search for `Dynamics CRM` (or `Power Platform` / `Dataverse`)
+3. Select the **Dynamics CRM** application
+4. Choose the permission type based on your authentication flow:
+ - **For app-only (client credentials, certificate)**: Select **Application permissions** and find `user_impersonation`
+ - **For user authentication (device code, delegated)**: Select **Delegated permissions** and find `user_impersonation`
+5. Click **Add permissions**
+6. Return to **API permissions** and click **Grant admin consent for [Your Organization]** (requires Azure AD administrator role)
+ - **Important**: Admin consent is required for service principal flows to function properly
+
+### 4. Choose an Authentication Method and Create Credentials
+
+The script supports three authentication methods. Choose one:
+
+#### Option A: Device Code (Interactive, Delegated — Recommended for Ad Hoc Runs)
+
+- **Best for**: Interactive runs, local development, ad hoc audits
+- **Requires**: Application (client) ID only (no secret needed)
+- **Flow**: You'll be prompted to visit a URL and enter a code on login.microsoft.com
+
+**No additional setup required.** Proceed to script configuration.
+
+#### Option B: Client Credentials (Non-Interactive, Service Principal with Client Secret)
+
+- **Best for**: Scheduled automation, unattended scripts, CI/CD pipelines
+- **Requires**: Application (client) ID and a client secret
+- **Security note**: Secrets must be stored securely (Azure Key Vault, CI/CD secure variables) and never checked into source control
+
+**Steps:**
+
+1. In the app registration, select **Certificates & secrets** > **Client secrets** > **+ New client secret**
+2. Provide a description (e.g., `Dataverse Auditing Script`)
+3. Choose an expiration period (shorter expiration is more secure; plan for rotation before expiry)
+4. Click **Add**
+5. **Immediately copy and record the secret value** — it will not be displayed again
+6. Store the secret in a secure secret management system:
+ - **Azure Key Vault** (recommended for Azure automation)
+ - **Local DPAPI-protected store** (for local scripts)
+ - **CI/CD secure environment variables** (GitHub Secrets, Azure DevOps Secure Variables)
+ - **Never hardcode secrets in the script or commit to version control**
+
+#### Option C: Client Certificate (Non-Interactive, Service Principal with Certificate)
+
+- **Best for**: Highly secure service principal scenarios, certificate-pinned automation
+- **Requires**: A valid X.509 certificate with a private key
+- **Security note**: Protect the certificate's private key and restrict file access
+
+**Steps:**
+
+1. Create or procure an X.509 certificate with a private key (RSA 2048-bit minimum recommended):
+ - **Option 1**: Create a self-signed certificate using PowerShell:
+   ```powershell
+   $cert = New-SelfSignedCertificate -CertStoreLocation "Cert:\CurrentUser\My" -Subject "CN=DataverseAuditingReader" -KeyExportPolicy Exportable
+   $thumbprint = $cert.Thumbprint
+   Write-Host "Certificate Thumbprint: $thumbprint"
+   # Export to PFX if needed for secure storage/deployment
+   # Export-PfxCertificate -Cert $cert -FilePath "cert.pfx" -Password (ConvertTo-SecureString "password" -AsPlainText -Force)
+   ```
+ - **Option 2**: Use an existing organizational CA-issued certificate
+2. Note the certificate **thumbprint** (40-character hex string)
+3. In the app registration, select **Certificates & secrets** > **Certificates** > **Upload certificate**
+4. Upload the public certificate (.cer or .pfx with only the public key)
+5. Verify the thumbprint matches
+6. Ensure the private key is protected:
+ - **Local machine**: Private key should be in the Windows certificate store (Cert:\CurrentUser\My or Cert:\LocalMachine\My)
+ - **Service account/automation**: The account running the script must have read access to the private key
+ - **Azure Key Vault** (recommended): Store the full certificate with private key in Key Vault
+
+### 5. Assign Dataverse Environment Permissions
+
+The authenticated user or service principal must have read access to Dataverse metadata.
+
+#### For User Authentication (Device Code Flow):
+
+1. Open the **Power Platform Admin Center** (https://admin.powerplatform.microsoft.com)
+2. Select your **Environment**
+3. Go to **Settings** > **Users + permissions** > **Users**
+4. Locate your user and verify it appears in the user list (if not, it will be auto-provisioned on first login)
+5. Assign an environment role:
+ - Go to **Settings** > **Users + permissions** > **Users**
+ - Select your user
+ - In the **Manage roles** section, assign at least one of:
+   - **System Administrator** (full access; use for ad hoc audits)
+   - **System Customizer** (read Dataverse metadata; sufficient for this script)
+   - **System Reader** (read-only access to metadata; sufficient for this script)
+ - Click **Save**
+
+#### For Service Principal Authentication (Client Credentials or Certificate):
+
+1. In the **Power Platform Admin Center**, select your **Environment**
+2. Go to **Settings** > **Users + permissions** > **Application users**
+3. Click **+ New app user**
+4. Click **Create** and search for your app registration by **Application ID** or **Name**
+5. Select the app registration and click **Create**
+6. In the **Manage roles** section, assign one of:
+ - **System Administrator**
+ - **System Customizer**
+ - **System Reader**
+ - **Custom role** with at least these metadata read privileges:
+   - `Read` on **EntityDefinitions** (to list tables)
+   - `Read` on **Attributes** (to list audited attributes)
+7. Click **Save**
+
+### 6. Enable Auditing in the Dataverse Environment
+
+Auditing must be enabled at the organization (environment) level and optionally configured per table and attribute.
+
+#### Enable Organization-Level Auditing:
+
+1. In the **Power Platform Admin Center**, select your **Environment**
+2. Go to **Settings** > **Auditing**
+3. Toggle **Start recording audit logs** to **On**
+ - **Note**: Organization-level auditing is a prerequisite for all table and attribute auditing
+ - **Note**: Enabling auditing may generate audit records and consume storage; review audit retention policies
+
+#### Enable Table-Level Auditing (Power Platform Maker Portal):
+
+1. In the **Power Platform Maker Portal** (https://make.powerapps.com), select your **Environment**
+2. In the left sidebar, expand **Data** and select **Tables**
+3. Locate the table you want to audit
+4. Open the table and go to **Settings** > **Advanced options**
+5. Under **Auditing**, toggle **Audit (if organization auditing is enabled)** to **On**
+6. Click **Save**
+
+#### Enable Attribute-Level Auditing (For Specific Columns):
+
+1. Follow the steps above to open the table in the Maker Portal
+2. Select the specific **column** (attribute) you want to audit
+3. In the **Properties** panel on the right, find **Advanced options** > **Auditing**
+4. Toggle **Enable auditing** to **On**
+5. Click **Save**
+
+**Note on audit log history**: Only log entries created *after* auditing is enabled are captured. Enabling auditing does not backfill historical audit data.
+
+### 7. Handling Multi-Cloud Scenarios
+
+The script automatically detects and configures for your cloud environment:
+
+| Cloud | OrgUrl Pattern | Azure Login | Dataverse Resource | Auto-Detected |
+|-------|---|---|---|---|
+| **Commercial** | `*.crm.dynamics.com` | `login.microsoftonline.com` | `crm.dynamics.com` | Yes |
+| **GCCH (US Govt)** | `*.microsoftdynamics.us` or `*.crm.microsoftdynamics.us` | `login.microsoftonline.us` | `crm.microsoftdynamics.us` | Yes |
+| **GCC (US Govt)** | `crm9.dynamics.com` (instance-style) | `login.microsoftonline.us` | `crm.microsoftdynamics.us` | Yes |
+
+**Important for government tenants**: Use the government tenant ID and government app registration endpoints. The script will validate the organization URL and automatically select the correct Azure and Dataverse endpoints.
+
+## Script Configuration
+
+Edit the configuration section at the top of `EnvironmentAuditingSummary.ps1` to match your environment and authentication method:
+
+### Configuration Examples
+
+#### Example 1: Device Code (Interactive)
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$Auth = 'devicecode'
+```
+
+#### Example 2: Client Credentials (Non-Interactive with Secret)
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$ClientSecret = "<your-client-secret>"  # store securely
+$Auth = 'clientcredentials'
+```
+
+#### Example 3: Client Certificate (Non-Interactive with Certificate)
+```powershell
+$OrgUrl = "https://contoso.crm.dynamics.com"
+$TenantId = "<tenant-guid>"
+$ClientId = "<app-client-id>"
+$CertificateThumbprint = "<thumbprint>"
+$Auth = 'clientcertificate'
+```
+
+### Common Configuration Values
+
+- **Output file/directory**: Set `$OutFile` to control the CSV output location and filename.
+- **Organization URL**: Ensure `$OrgUrl` matches your target Dataverse environment. This should be in the format `https://<your-org>.crm.dynamics.com` or `https://<your-org>.microsoftdynamics.us` for GCCH/GCC.
+- **Tenant ID, Client ID, Client Secret/Thumbprint**: These must be populated based on your Azure AD app registration and chosen authentication method.
+
+## Script Execution
+
+1. Open a PowerShell terminal.
+2. Navigate to the directory containing `EnvironmentAuditingSummary.ps1`.
+3. Execute the script:
+ ```powershell
+ pwsh -File .\EnvironmentAuditingSummary.ps1
+ ```
+
+4. Review the output CSV file and any diagnostics information logged by the script.
+
+## Advanced Usage
+
+### Fine-Grained Control Over Output
+
+- To customize the output columns or CSV formatting, modify the `Export-Csv` command parameters in the script.
+- For complex filtering or processing, consider loading the output CSV into a data processing tool or script.
+
+### Automation and Scheduling
+
+- The script is designed for ease of automation:
+ - For non-interactive authentication, use client credentials or certificate options.
+ - Schedule the script using Task Scheduler, Azure Automation, or your preferred automation tool.
+ - Ensure any secrets or certificates are securely accessible by the automation context.
+
+### Scheduling with Task Scheduler or Cron
+
+For regular audit inventory runs, schedule the script:
+
+**Windows Task Scheduler:**
+
