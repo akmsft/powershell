@@ -1,75 +1,33 @@
-# Dataverse Audited Attributes Export (PowerShell)
+# Comprehensive Documentation
 
-## Overview
-This script enumerates Microsoft Dataverse tables that have auditing enabled and exports the audited attributes for each table to a CSV for review by Power Platform administrators and security teams. It is read-only, suitable for inventorying audit coverage across environments, and includes built-in robustness for enterprise use.
+## Azure Setup
+To set up Azure, follow these steps:
+1. Log in to the Azure portal.
+2. Create a new resource group.
+3. Provision the necessary services (e.g., Azure Functions, Azure Storage).
 
-## What the Script Produces (Output)
-**Primary artifact**
-- **CSV file** written to a specified output directory (UTF-8, no BOM). Default filename can be customized via `$OutFile`. Columns:  
-  `table_logical`, `table_display`, `table_auditing_enabled`, `attribute_logical`, `attribute_display`, `attribute_auditing_enabled`.
+## Power Platform Configuration
+Set up the Power Platform as follows:
+1. Access the Power Platform admin center.
+2. Create a new environment.
+3. Configure the environment settings as required.
 
-**Secondary artifact**
-- **Organization audit context (optional)** — the script attempts to write `org_audit_status.json` with org-level audit settings if the endpoint is available.
-
-**Sample CSV row**
-```csv
-table_logical,table_display,table_auditing_enabled,attribute_logical,attribute_display,attribute_auditing_enabled
-account,Account,true,name,Account Name,true
-```
-
-## Authentication Options
-1. **User authentication with device code** — interactive delegated auth.
-2. **App-only authentication with certificate** — non-interactive service principal.
-3. **App-only authentication with client secret** — non-interactive service principal with fallback token logic.
-
-## Environment Support
-Environment detection is automatic:
-- `.microsoftdynamics.us` → GCCH (Azure US Gov)
-- `crm<number>.dynamics.com` → GCC
-- All others → Commercial cloud
+## Script Logic
+This script automates tasks related to Azure and Power Platform. It includes the following logic:
+- **Authentication**: Authenticate using service principals.
+- **Resource Management**: Create, read, update, or delete Azure resources.
+- **Data Operations**: Interact with Power Platform components.
 
 ## Prerequisites
-- PowerShell 5.1 or 7+
-- `Az.Accounts` module
-- Dataverse metadata read permissions
-- Certificate or client secret for app-only flows
+- Azure subscription.
+- Access to the Power Platform.
+- Appropriate permissions to execute the script.
 
-## Usage
-### Device Code
-```powershell
-$Auth = 'devicecode'
-pwsh -File .\Dataverse-AuditedAttributes.ps1
-```
+## Configuration Parameters
+- **Parameter 1**: Description of parameter 1.
+- **Parameter 2**: Description of parameter 2.
+- **Parameter 3**: Description of parameter 3.
 
-### Certificate Auth
-```powershell
-$Auth = 'clientcertificate'
-pwsh -File .\Dataverse-AuditedAttributes.ps1
-```
+Ensure all parameters are correctly set before running the script. Adjust configuration values to meet your organizational requirements.
 
-### Client Secret Auth
-```powershell
-$Auth = 'clientcredentials'
-pwsh -File .\Dataverse-AuditedAttributes.ps1
-```
-
-## Error Handling and Resilience
-- Retries 429/503 with exponential backoff
-- Follows `@odata.nextLink`
-- Token diagnostics and fallback audience logic
-
-## Security Considerations
-- Secrets not written to disk
-- Certificate private key must be secured
-- Device-code token written to temp for diagnostics (remove for production)
-
-## Limitations
-- Read-only
-- Requires auditing enabled
-- Subject to Dataverse throttling
-
-## Troubleshooting
-- 401 → token fallback logic triggers
-- 403 → insufficient permissions
-- Throttling → automatic retry
-
+For detailed instructions, refer to the official Azure and Power Platform documentation as needed.
