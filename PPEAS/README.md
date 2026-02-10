@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PowerShell script (`EnvironmentAuditingSummary.ps1`) enumerates Microsoft Dataverse tables that have auditing enabled and exports the audited attributes for each table to a CSV file. The script is designed for Power Platform administrators and security teams to inventory and review audit coverage across Dataverse environments.
+This PowerShell script (`docs/EnvironmentAuditingSummary.ps1`) enumerates Microsoft Dataverse tables that have auditing enabled and exports the audited attributes for each table to a CSV file. The script is designed for Power Platform administrators and security teams to inventory and review audit coverage across Dataverse environments.
 
 ### Key Features
 
@@ -276,7 +276,7 @@ Now that Azure and Power Platform are prepared, configure the script with your s
 ### Opening the Script for Configuration
 
 1. Download or clone the repository to your local machine
-2. Open `EnvironmentAuditingSummary.ps1` in a text editor (PowerShell ISE, VS Code with PowerShell extension, or Notepad)
+2. Open `docs/EnvironmentAuditingSummary.ps1` in a text editor (PowerShell ISE, VS Code with PowerShell extension, or Notepad)
 3. Scroll to the top of the file to find the **Configuration** section (marked by `# -------------------------`)
 4. Edit the variables to match your environment (see examples below)
 
