@@ -1,4 +1,4 @@
-# Power Platform Environment Audited Table & Field Summary (PowerShell)
+# Power Platform Environment Auditing Summary (PowerShell)
 
 ## Overview
 
