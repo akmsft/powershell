@@ -47,7 +47,7 @@ Each site is then assigned an overall risk tier:
 |---|---|
 | **Critical** | Site has zero valid/active owners (including when the only owner is an empty group) |
 | **High** | Group-connected site has no valid group owners; or another owner exists, but a group-principal owner/admin has zero active members |
-| **Medium** | Site has only a single active owner (single point of failure), an unverifiable group-principal admin, or a deleted/unresolved owner |
+| **Medium** | Site has only a single active owner (single point of failure), an unverifiable group-principal admin, a deleted/unresolved owner, or a group-principal owner/admin has active members but zero owners of its own |
 | **Low** | No issues found |
 | **Unknown** | Site has zero *confirmed* active owners, but site collection admin data couldn't be checked for this site (may have unseen admins) — see limitation below |
 
@@ -235,6 +235,14 @@ per-run with `-IdentityProvider`:
   Access System Group). This check also requires `MicrosoftGraph` identity
   provider mode; in `ExchangeOnline` mode, group-principal owners/admins are
   not verified at all and remain unverified/`Valid`.
+- **Group-owner-governance check:** for a real security group used directly
+  as a Site Collection Administrator (not the M365 Group owners sub-role),
+  the script also checks whether that group itself has any owners. A group
+  can have active members (so SharePoint access still works) but zero
+  owners — meaning nobody can manage its membership going forward. This is
+  reported separately as a lower-severity `Medium` risk (`GroupHasNoOwners`
+  risk flag) and does not affect the primary `AccountStatus`/`EmptyGroup`
+  determination above.
 - **AppOnly/unattended mode is untested by the author** in a live scheduled
   run — see the warning under [Authentication modes](#authentication-modes).
 

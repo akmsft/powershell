@@ -89,6 +89,10 @@
     .\Get-SPOOrphanedOwnerAudit.ps1 -MaxSites 5 -Verbose
 
 .EXAMPLE
+    # Run against a single, specific site only (useful for testing/troubleshooting).
+    .\Get-SPOOrphanedOwnerAudit.ps1 -SiteUrl "https://contoso.sharepoint.com/sites/Test" -Verbose
+
+.EXAMPLE
     # Run and place reports in a specific folder.
     .\Get-SPOOrphanedOwnerAudit.ps1 -OutputFolder "C:\Audits\SPOOwnership" -Verbose
 
@@ -136,6 +140,11 @@ param(
     # Optional cap on number of sites processed. Useful for a safe first test run.
     # Leave $null (default) to process all sites.
     [int]$MaxSites,
+
+    # Optional: restrict the run to a single site (exact URL match), e.g. for
+    # testing a specific known scenario without waiting on a full-tenant run.
+    # Leave blank (default) to process all sites.
+    [string]$SiteUrl,
 
     # Folder where CSV reports will be written. Defaults to a subfolder next to the script.
     [string]$OutputFolder = (Join-Path -Path $PSScriptRoot -ChildPath 'AuditReports'),
@@ -578,10 +587,18 @@ function Normalize-SPOLoginName {
         UPN           = $null
         PrincipalType = "Unknown"
         # Entra ID object GUID of the group, when the claim format actually
-        # encodes one (only true for real, queryable security/M365 groups --
-        # see the two GroupPrincipal branches below). Populated so the caller
-        # can look up whether the group has any active members.
+        # encodes one (only true for the two GroupPrincipal branches below
+        # that set it). Populated so the caller can look up whether the
+        # group has any active members/owners.
         GroupObjectId = $null
+        # For the c:0o.c|federateddirectoryclaimprovider|<guid>_o / _m claim
+        # format specifically: this GUID is an M365 Group's ID, and the
+        # suffix says whether the claim represents that group's OWNERS
+        # ("Owner") or MEMBERS ("Member") sub-role -- NOT the group itself.
+        # $null for the c:0t.c|tenant|<guid> format, which (confirmed via
+        # live testing against a real tenant) represents a plain, directly
+        # queryable Entra ID security group's own membership.
+        GroupRole     = $null
     }
 
     if ([string]::IsNullOrWhiteSpace($LoginName)) {
@@ -602,24 +619,43 @@ function Normalize-SPOLoginName {
         return $result
     }
 
-    # SharePoint / Entra security group or M365 group claim, referencing a
-    # real, queryable Entra ID group object by GUID. Unlike a user UPN, this
-    # is the group's directory object ID, so its actual membership CAN be
-    # checked via Graph (see Test-EntraGroupStatus) rather than blindly
-    # trusted as "Valid".
-    if ($LoginName -match '^c:0o\.c\|federateddirectoryclaimprovider\|(?<groupid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+    # c:0o.c|federateddirectoryclaimprovider|<guid>[_o|_m] -- confirmed via
+    # live testing to represent a Microsoft 365 Group's OWNERS ("_o") or
+    # MEMBERS ("_m") sub-role, where <guid> is the M365 Group's own object
+    # ID (frequently the SAME group already backing a group-connected site,
+    # i.e. the same ID as $site.GroupId). This is NOT an independent,
+    # directly-queryable group -- the correct Graph check depends on the
+    # suffix (Get-MgGroupOwner for "_o", Get-MgGroupMember for "_m"). No
+    # suffix at all is unresolved territory (not observed in testing); left
+    # unverified/Valid rather than guessing.
+    if ($LoginName -match '^c:0o\.c\|federateddirectoryclaimprovider\|(?<groupid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?<suffix>_[a-z])?$') {
         $result.PrincipalType = "GroupPrincipal"
-        $result.GroupObjectId = $Matches['groupid']
+        switch ($Matches['suffix']) {
+            "_o" { $result.GroupObjectId = $Matches['groupid']; $result.GroupRole = "Owner" }
+            "_m" { $result.GroupObjectId = $Matches['groupid']; $result.GroupRole = "Member" }
+            default { } # unrecognized/no suffix: leave unverified
+        }
         return $result
     }
 
-    # "Everyone"/"Everyone except external users" tenant-wide claims, and
-    # SharePoint's built-in permission-level groups (e.g. Limited Access
-    # System Group), are not real, queryable Entra ID group objects -- there
-    # is no GroupObjectId here, so membership can't be verified and this
-    # remains treated as unverified/Valid, same as before.
-    if ($LoginName -match '^c:0t\.c\|tenant\|' -or
-        $LoginName -match '^c:0-\.f\|rolemanager\|') {
+    # c:0t.c|tenant|<guid> -- confirmed via live testing to represent a
+    # plain, directly-queryable Entra ID security group's own object ID (not
+    # a generic tenant-wide "Everyone" claim, despite some older/generic
+    # documentation suggesting otherwise -- always verify claim formats
+    # against your own tenant if this script behaves unexpectedly). Its own
+    # membership can be checked directly via Get-MgGroupMember.
+    if ($LoginName -match '^c:0t\.c\|tenant\|(?<groupid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$') {
+        $result.PrincipalType = "GroupPrincipal"
+        $result.GroupObjectId = $Matches['groupid']
+        $result.GroupRole = "Member"
+        return $result
+    }
+
+    # SharePoint's built-in tenant-wide "Everyone except external users"
+    # claim (spo-grid-all-users/<tenantId>) is not a real, queryable Entra ID
+    # group object -- there is no GroupObjectId here, so membership can't be
+    # verified and this remains treated as unverified/Valid, same as before.
+    if ($LoginName -match '^c:0-\.f\|rolemanager\|') {
         $result.PrincipalType = "GroupPrincipal"
         return $result
     }
@@ -795,25 +831,42 @@ function Test-EntraUserExists {
     A group with zero active members/owners provides no real ownership at
     all, which is exactly the kind of orphaned-ownership risk this audit
     exists to catch. This function checks whether the group itself still
-    exists in Entra ID, and if so, whether it currently has any members.
+    exists in Entra ID, and if so, whether it currently has any members (or
+    owners, for claims that specifically represent an M365 Group's owner
+    sub-role -- see the -Role parameter).
 
     LIMITATION: only meaningful for group claims that resolve to a real Entra
     ID GroupObjectId (see Normalize-SPOLoginName); requires MicrosoftGraph as
-    the identity provider (Get-MgGroup/Get-MgGroupMember use the same
-    Group.Read.All permission already required for M365-Group-connected site
-    checks -- no new consent is needed).
+    the identity provider (Get-MgGroup/Get-MgGroupOwner/Get-MgGroupMember use
+    the same Group.Read.All permission already required for M365-Group-
+    connected site checks -- no new consent is needed).
 #>
 function Test-EntraGroupStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$GroupObjectId
+        [string]$GroupObjectId,
+
+        # "Member" (default) checks Get-MgGroupMember; "Owner" checks
+        # Get-MgGroupOwner instead -- used for the c:0o.c|...|<guid>_o claim
+        # format, which represents an M365 Group's OWNERS specifically, not
+        # its general membership.
+        [ValidateSet("Member", "Owner")]
+        [string]$Role = "Member"
     )
 
     $outcome = [pscustomobject]@{
         Status        = "Unresolved"
         MemberCount   = $null
         ErrorDetail   = $null
+        # Only populated when $Role -eq "Member" (a plain, directly-assigned
+        # security group). Tracks a distinct, lower-severity governance gap:
+        # the group still has active members (so SharePoint access via this
+        # assignment works fine), but has zero owners, so nobody can manage
+        # its membership going forward. Not applicable when $Role -eq
+        # "Owner", since that claim format already IS an owner-list check.
+        GroupOwnerCount    = $null
+        HasNoGroupOwners   = $false
     }
 
     try {
@@ -837,10 +890,15 @@ function Test-EntraGroupStatus {
     }
 
     try {
-        # -All ensures the true member count is seen rather than just the
-        # first page. This audit only needs to know whether the group is
+        # -All ensures the true count is seen rather than just the first
+        # page. This audit only needs to know whether the group/role is
         # empty, not its exact size, so a plain count is sufficient.
-        $members = Invoke-WithRetry -ScriptBlock { Get-MgGroupMember -GroupId $GroupObjectId -All -ErrorAction Stop }
+        $members = if ($Role -eq "Owner") {
+            Invoke-WithRetry -ScriptBlock { Get-MgGroupOwner -GroupId $GroupObjectId -All -ErrorAction Stop }
+        }
+        else {
+            Invoke-WithRetry -ScriptBlock { Get-MgGroupMember -GroupId $GroupObjectId -All -ErrorAction Stop }
+        }
         $memberCount = ($members | Measure-Object).Count
         $outcome.MemberCount = $memberCount
         $outcome.Status = if ($memberCount -eq 0) { "EmptyGroup" } else { "Valid" }
@@ -849,7 +907,24 @@ function Test-EntraGroupStatus {
         $errMsg = $_.Exception.Message
         $outcome.ErrorDetail = $errMsg
         $outcome.Status = "Unresolved"
-        Write-Verbose "Test-EntraGroupStatus: could not enumerate members for group '$GroupObjectId' - $errMsg"
+        Write-Verbose "Test-EntraGroupStatus: could not enumerate ${Role}s for group '$GroupObjectId' - $errMsg"
+    }
+
+    # Secondary, lower-severity governance check: does this group (checked
+    # as a plain security group, i.e. Role -eq "Member") have any owners of
+    # its own? Only meaningful if the member check above actually succeeded
+    # (Valid or EmptyGroup) -- if the group lookup itself failed/was
+    # unresolved, skip this to avoid a confusing partial result.
+    if ($Role -eq "Member" -and $outcome.Status -in @("Valid", "EmptyGroup")) {
+        try {
+            $owners = Invoke-WithRetry -ScriptBlock { Get-MgGroupOwner -GroupId $GroupObjectId -All -ErrorAction Stop }
+            $ownerCount = ($owners | Measure-Object).Count
+            $outcome.GroupOwnerCount = $ownerCount
+            $outcome.HasNoGroupOwners = ($ownerCount -eq 0)
+        }
+        catch {
+            Write-Verbose "Test-EntraGroupStatus: could not enumerate owners for group '$GroupObjectId' - $($_.Exception.Message)"
+        }
     }
 
     return $outcome
@@ -915,41 +990,50 @@ function Get-AccountStatusNote {
         # Set when this row's owner/admin is a GroupPrincipal, so the wording
         # correctly says "group" instead of "account" for the shared status
         # values (DeletedFromEntra/Unresolved) reused by both users and groups.
-        [switch]$IsGroupPrincipal
+        [switch]$IsGroupPrincipal,
+
+        # Set when this row's group has active members (access still works)
+        # but zero owners of its own (nobody can manage its membership going
+        # forward). A separate, lower-severity governance note appended
+        # regardless of AccountStatus (Valid or EmptyGroup).
+        [switch]$GroupHasNoOwners
     )
 
+    $note = ""
     switch ($AccountStatus) {
         "DeletedFromEntra" {
             if ($IsGroupPrincipal) {
-                return "This owner is a security/Microsoft 365 group that no longer exists in Entra ID. Display name/Entra object ID are unavailable because the directory lookup found no matching group; only the login captured at audit time identifies this owner."
+                $note = "This owner is a security/Microsoft 365 group that no longer exists in Entra ID. Display name/Entra object ID are unavailable because the directory lookup found no matching group; only the login captured at audit time identifies this owner."
             }
-            return "Account no longer exists in Entra ID (or no longer has a mailbox, if using ExchangeOnline identity provider). Display name/Entra object ID are unavailable because the directory lookup found no matching record; only the login/UPN captured at audit time identifies this owner."
+            else {
+                $note = "Account no longer exists in Entra ID (or no longer has a mailbox, if using ExchangeOnline identity provider). Display name/Entra object ID are unavailable because the directory lookup found no matching record; only the login/UPN captured at audit time identifies this owner."
+            }
         }
         "EmptyGroup" {
-            $base = "This owner is a security/Microsoft 365 group that currently has zero members, so no one can actually act as owner through this assignment. Add at least one active member to the group, or assign a different owner directly."
+            $note = "This owner is a security/Microsoft 365 group that currently has zero members, so no one can actually act as owner through this assignment. Add at least one active member to the group, or assign a different owner directly."
             if (-not [string]::IsNullOrWhiteSpace($ErrorDetail)) {
-                return "$base Underlying error: $ErrorDetail"
+                $note = "$note Underlying error: $ErrorDetail"
             }
-            return $base
         }
         "Unresolved" {
             if ($IsGroupPrincipal) {
-                $base = "This owner is a group whose membership could not be verified (e.g., Microsoft Graph is unavailable in ExchangeOnline identity-provider mode, a lookup error occurred, or this is an 'Everyone'/tenant-wide or SharePoint permission-level claim that has no queryable Entra ID group behind it). This does NOT necessarily mean the group is empty -- re-verify manually before taking action."
-                if (-not [string]::IsNullOrWhiteSpace($ErrorDetail)) {
-                    return "$base Underlying error: $ErrorDetail"
-                }
-                return $base
+                $note = "This owner is a group whose membership could not be verified (e.g., Microsoft Graph is unavailable in ExchangeOnline identity-provider mode, a lookup error occurred, or this is an 'Everyone'/tenant-wide or SharePoint permission-level claim that has no queryable Entra ID group behind it). This does NOT necessarily mean the group is empty -- re-verify manually before taking action."
             }
-            $base = "Identity could not be resolved (e.g., malformed login, unsupported principal type, or a lookup error). Display name/Entra object ID are unavailable; only the login/UPN captured at audit time identifies this owner. This does NOT necessarily mean the account is deleted -- re-verify before taking action."
+            else {
+                $note = "Identity could not be resolved (e.g., malformed login, unsupported principal type, or a lookup error). Display name/Entra object ID are unavailable; only the login/UPN captured at audit time identifies this owner. This does NOT necessarily mean the account is deleted -- re-verify before taking action."
+            }
             if (-not [string]::IsNullOrWhiteSpace($ErrorDetail)) {
-                return "$base Underlying error: $ErrorDetail"
+                $note = "$note Underlying error: $ErrorDetail"
             }
-            return $base
-        }
-        default {
-            return ""
         }
     }
+
+    if ($GroupHasNoOwners) {
+        $governanceNote = "This group currently has zero owners of its own -- SharePoint access via its members still works today, but nobody can add/remove members going forward. Nominate at least one group owner to keep it maintainable."
+        $note = if ([string]::IsNullOrWhiteSpace($note)) { $governanceNote } else { "$note $governanceNote" }
+    }
+
+    return $note
 }
 
 <#
@@ -1080,7 +1164,14 @@ function Add-OwnerResult {
         [string]$EntraObjectId,
         [Parameter(Mandatory)][string]$AccountStatus,
         [string]$RiskFlag = "",
-        [string]$Notes = ""
+        [string]$Notes = "",
+        # True when this row is a group-principal owner/admin whose
+        # underlying security group has active members (so SharePoint access
+        # via this assignment still works) but zero group owners (so nobody
+        # can manage/update that group's membership going forward). This is
+        # a lower-severity governance concern, distinct from AccountStatus
+        # (which tracks whether the assignment currently grants real access).
+        [bool]$GroupOwnerGovernanceRisk = $false
     )
 
     $script:OwnerResults.Add([pscustomobject]@{
@@ -1097,6 +1188,7 @@ function Add-OwnerResult {
         AccountStatus     = $AccountStatus
         RiskFlag          = $RiskFlag
         Notes             = $Notes
+        GroupOwnerGovernanceRisk = $GroupOwnerGovernanceRisk
     })
 }
 
@@ -1136,11 +1228,18 @@ function Add-SiteSummary {
     $unresolvedOwnerCount = ($unresolvedOwners | Measure-Object).Count
     $emptyGroupOwnerCount = ($emptyGroupOwners | Measure-Object).Count
 
+    # Rows where the group has active members (access works) but zero
+    # owners of its own (nobody can manage its membership going forward) --
+    # a separate, lower-severity governance concern from the above.
+    $groupOwnerGovernanceRiskRows = $SiteOwnerRows | Where-Object { $_.GroupOwnerGovernanceRisk -eq $true }
+    $groupOwnerGovernanceRiskCount = ($groupOwnerGovernanceRiskRows | Measure-Object).Count
+
     $hasSingleOwnerRisk    = ($activeOwnerCount -eq 1)
     $hasNoActiveOwnersRisk = ($activeOwnerCount -eq 0)
     $hasEmptyGroupRisk     = ($emptyGroupOwnerCount -gt 0)
     $hasGroupOwnerRisk     = (-not [string]::IsNullOrWhiteSpace($GroupId)) -and (($activeGroupOwners | Measure-Object).Count -eq 0)
     $hasGroupPrincipalAdminRisk = (($groupPrincipals | Measure-Object).Count -gt 0)
+    $hasGroupOwnerGovernanceRisk = ($groupOwnerGovernanceRiskCount -gt 0)
 
     # Overall risk level: simple tiered classification an admin can triage by.
     $overallRisk = "Low"
@@ -1182,6 +1281,10 @@ function Add-SiteSummary {
         $overallRisk = "Medium"
         $recommendedAction = "Remove or replace deleted/unresolved owners at your convenience."
     }
+    elseif ($hasGroupOwnerGovernanceRisk) {
+        $overallRisk = "Medium"
+        $recommendedAction = "A security group used as an owner/admin here has active members (site access still works) but zero owners of its own. Nominate at least one owner for that group so its membership can still be maintained going forward."
+    }
 
     $script:SiteSummaries.Add([pscustomobject]@{
         SiteUrl                = $SiteUrl
@@ -1190,10 +1293,12 @@ function Add-SiteSummary {
         DeletedOwnerCount      = $deletedOwnerCount
         UnresolvedOwnerCount   = $unresolvedOwnerCount
         EmptyGroupOwnerCount   = $emptyGroupOwnerCount
+        GroupOwnerGovernanceRiskCount = $groupOwnerGovernanceRiskCount
         HasSingleOwnerRisk     = $hasSingleOwnerRisk
         HasNoActiveOwnersRisk  = $hasNoActiveOwnersRisk
         HasEmptyGroupRisk      = $hasEmptyGroupRisk
         HasGroupOwnerRisk      = $hasGroupOwnerRisk
+        HasGroupOwnerGovernanceRisk = $hasGroupOwnerGovernanceRisk
         SiteCollectionAdminDataUnavailable = [bool]$SiteCollectionAdminDataUnavailable
         OverallRiskLevel       = $overallRisk
         RecommendedAction      = $recommendedAction
@@ -1335,7 +1440,14 @@ try {
     Write-Host "Enumerating SharePoint Online sites (this may take a while for large tenants)..." -ForegroundColor Cyan
     $allSites = Get-PnPTenantSite -Detailed -Connection $script:PnPAdminConnection -ErrorAction Stop
 
-    if ($MaxSites -and $MaxSites -gt 0) {
+    if (-not [string]::IsNullOrWhiteSpace($SiteUrl)) {
+        Write-Verbose "SiteUrl specified: limiting to '$SiteUrl' only."
+        $allSites = $allSites | Where-Object { $_.Url -eq $SiteUrl }
+        if (($allSites | Measure-Object).Count -eq 0) {
+            throw "No site matching -SiteUrl '$SiteUrl' was found among the enumerated tenant sites. Check the URL is exact (including https:// and no trailing slash)."
+        }
+    }
+    elseif ($MaxSites -and $MaxSites -gt 0) {
         Write-Verbose "MaxSites specified: limiting to first $MaxSites site(s)."
         $allSites = $allSites | Select-Object -First $MaxSites
     }
@@ -1382,6 +1494,7 @@ try {
                 $entraId = $null
                 $displayName = $null
                 $errorDetail = $null
+                $groupOwnerGovernanceRisk = $false
 
                 if ($normalized.PrincipalType -in @("Member", "ExternalOrGuest") -and $normalized.UPN) {
                     if (-not $entraUserCache.ContainsKey($normalized.UPN)) {
@@ -1395,12 +1508,15 @@ try {
                 }
                 elseif ($normalized.PrincipalType -eq "GroupPrincipal") {
                     if ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
-                        if (-not $groupStatusCache.ContainsKey($normalized.GroupObjectId)) {
-                            $groupStatusCache[$normalized.GroupObjectId] = Test-EntraGroupStatus -GroupObjectId $normalized.GroupObjectId
+                        $groupRole = if ($normalized.GroupRole) { $normalized.GroupRole } else { "Member" }
+                        $groupCacheKey = "$($normalized.GroupObjectId)|$groupRole"
+                        if (-not $groupStatusCache.ContainsKey($groupCacheKey)) {
+                            $groupStatusCache[$groupCacheKey] = Test-EntraGroupStatus -GroupObjectId $normalized.GroupObjectId -Role $groupRole
                         }
-                        $groupLookup = $groupStatusCache[$normalized.GroupObjectId]
+                        $groupLookup = $groupStatusCache[$groupCacheKey]
                         $status = $groupLookup.Status
                         $errorDetail = $groupLookup.ErrorDetail
+                        $groupOwnerGovernanceRisk = [bool]$groupLookup.HasNoGroupOwners
                     }
                     else {
                         # Not a real, queryable Entra group (e.g. a tenant-wide
@@ -1417,6 +1533,7 @@ try {
                 $riskFlag = ""
                 if ($status -eq "EmptyGroup") { $riskFlag = "EmptyGroupOwner" }
                 elseif ($status -in @("DeletedFromEntra", "Unresolved")) { $riskFlag = "OrphanedOwnerProperty" }
+                if ($groupOwnerGovernanceRisk) { $riskFlag = if ($riskFlag) { "$riskFlag,GroupHasNoOwners" } else { "GroupHasNoOwners" } }
 
                 $ownerRow = [pscustomobject]@{
                     OwnerSource       = "SiteOwnerProperty"
@@ -1426,6 +1543,7 @@ try {
                     PrincipalType     = $normalized.PrincipalType
                     EntraObjectId     = $entraId
                     AccountStatus     = $status
+                    GroupOwnerGovernanceRisk = $groupOwnerGovernanceRisk
                 }
 
                 Add-OwnerResult -SiteUrl $siteUrl -SiteTitle $site.Title -SiteTemplate $site.Template `
@@ -1433,7 +1551,8 @@ try {
                     -LoginName $ownerRow.LoginName -UserPrincipalName $ownerRow.UserPrincipalName `
                     -PrincipalType $ownerRow.PrincipalType -EntraObjectId $ownerRow.EntraObjectId `
                     -AccountStatus $ownerRow.AccountStatus -RiskFlag $riskFlag `
-                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal"))
+                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk) `
+                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk
 
                 $siteOwnerRows.Add($ownerRow)
             }
@@ -1452,6 +1571,7 @@ try {
                 $entraId = $null
                 $displayName = $admin.DisplayName
                 $errorDetail = $null
+                $groupOwnerGovernanceRisk = $false
 
                 switch ($normalized.PrincipalType) {
                     { $_ -in @("Member", "ExternalOrGuest") } {
@@ -1471,12 +1591,15 @@ try {
                     }
                     "GroupPrincipal" {
                         if ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
-                            if (-not $groupStatusCache.ContainsKey($normalized.GroupObjectId)) {
-                                $groupStatusCache[$normalized.GroupObjectId] = Test-EntraGroupStatus -GroupObjectId $normalized.GroupObjectId
+                            $groupRole = if ($normalized.GroupRole) { $normalized.GroupRole } else { "Member" }
+                            $groupCacheKey = "$($normalized.GroupObjectId)|$groupRole"
+                            if (-not $groupStatusCache.ContainsKey($groupCacheKey)) {
+                                $groupStatusCache[$groupCacheKey] = Test-EntraGroupStatus -GroupObjectId $normalized.GroupObjectId -Role $groupRole
                             }
-                            $groupLookup = $groupStatusCache[$normalized.GroupObjectId]
+                            $groupLookup = $groupStatusCache[$groupCacheKey]
                             $status = $groupLookup.Status
                             $errorDetail = $groupLookup.ErrorDetail
+                            $groupOwnerGovernanceRisk = [bool]$groupLookup.HasNoGroupOwners
                         }
                         else {
                             $status = "Valid"
@@ -1495,6 +1618,7 @@ try {
                     }
                 }
                 elseif ($status -in @("DeletedFromEntra", "Unresolved")) { $riskFlag = "OrphanedSiteAdmin" }
+                if ($groupOwnerGovernanceRisk) { $riskFlag = if ($riskFlag) { "$riskFlag,GroupHasNoOwners" } else { "GroupHasNoOwners" } }
 
                 $ownerRow = [pscustomobject]@{
                     OwnerSource       = "SiteCollectionAdmin"
@@ -1504,6 +1628,7 @@ try {
                     PrincipalType     = $normalized.PrincipalType
                     EntraObjectId     = $entraId
                     AccountStatus     = $status
+                    GroupOwnerGovernanceRisk = $groupOwnerGovernanceRisk
                 }
 
                 Add-OwnerResult -SiteUrl $siteUrl -SiteTitle $site.Title -SiteTemplate $site.Template `
@@ -1511,7 +1636,8 @@ try {
                     -LoginName $ownerRow.LoginName -UserPrincipalName $ownerRow.UserPrincipalName `
                     -PrincipalType $ownerRow.PrincipalType -EntraObjectId $ownerRow.EntraObjectId `
                     -AccountStatus $ownerRow.AccountStatus -RiskFlag $riskFlag `
-                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal"))
+                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk) `
+                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk
 
                 $siteOwnerRows.Add($ownerRow)
             }
