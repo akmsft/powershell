@@ -120,3 +120,31 @@ $AppOnlyCertificateThumbprint = ""
 # registration -- this value is tenant-specific and will NOT work for any
 # tenant other than the one it was registered in.
 $PnPClientId = "<your-app-registration-client-id>"
+
+# ---------------------------------------------------------------------------
+# EXCLUDED GROUPS (skip membership/ownership checks entirely)
+# ---------------------------------------------------------------------------
+# Some organizations have one or more "everyone" style security or Microsoft
+# 365 groups (e.g., "All Employees", "All Staff") assigned as a site Owner or
+# Site Collection Admin. These groups are typically huge, always have active
+# members, and checking them wastes time/API calls on every run for a result
+# that's already known in advance.
+#
+# List the Entra ID Object ID (GUID) of any group(s) you want the script to
+# skip checking. A group listed here is automatically treated as a valid,
+# active owner/admin (AccountStatus = "Valid") without calling Microsoft
+# Graph to verify its membership or ownership — it will still appear in the
+# Detail report tab, with a note explaining it was excluded via configuration,
+# so the exclusion stays visible/auditable rather than silently hidden.
+#
+# Find a group's Object ID in the Entra admin center (Groups > select the
+# group > Object ID), or via: Get-MgGroup -Filter "DisplayName eq 'All Employees'"
+#
+# Leave as an empty array (default) to check every group normally. Named
+# "Default..." (like $DefaultIdentityProvider above), NOT "ExcludedGroupObjectIds",
+# so it never collides with -ExcludedGroupObjectIds the runtime parameter --
+# config.ps1 is dot-sourced AFTER script parameters are bound, so a variable
+# with the exact same name here would silently overwrite your override.
+$DefaultExcludedGroupObjectIds = @(
+    # "11111111-1111-1111-1111-111111111111"   # e.g., "All Employees"
+)

@@ -108,6 +108,12 @@
     # config.sample.ps1 for the accuracy limitation this introduces.
     .\Get-SPOOrphanedOwnerAudit.ps1 -IdentityProvider ExchangeOnline -Verbose
 
+.EXAMPLE
+    # Skip membership/ownership checks for one or more known "everyone" style
+    # groups (e.g., "All Employees"), overriding $ExcludedGroupObjectIds in
+    # config.ps1 for this run only.
+    .\Get-SPOOrphanedOwnerAudit.ps1 -ExcludedGroupObjectIds "11111111-1111-1111-1111-111111111111" -Verbose
+
 .NOTES
     SCHEDULING THIS SCRIPT (Windows Task Scheduler)
 
@@ -158,6 +164,12 @@ param(
     # "MicrosoftGraph" (default) or "ExchangeOnline" (Graph-free fallback).
     [ValidateSet("MicrosoftGraph", "ExchangeOnline")]
     [string]$IdentityProvider,
+
+    # Overrides $ExcludedGroupObjectIds from config.ps1, if supplied. One or
+    # more Entra ID group Object IDs (GUIDs) to treat as automatically valid
+    # without checking membership/ownership -- useful for "All Employees"
+    # style groups. See config.sample.ps1 for details.
+    [string[]]$ExcludedGroupObjectIds,
 
     # If set, missing required modules are installed automatically (CurrentUser scope)
     # after a one-time confirmation prompt. Suitable for unattended/scheduled runs
@@ -211,6 +223,16 @@ $requiredConfigVars = @(
     'AppOnlyClientId', 'AppOnlyTenantId', 'AppOnlyCertificateThumbprint',
     'PnPClientId'
 )
+# DefaultExcludedGroupObjectIds was added after the initial release of
+# config.sample.ps1; treat a missing/undefined value in an older config.ps1
+# as an empty list rather than a hard failure, so existing configs keep
+# working untouched. NOTE: deliberately named "Default..." (not
+# "ExcludedGroupObjectIds") so config.ps1's dot-sourcing above cannot
+# silently clobber the -ExcludedGroupObjectIds script parameter -- the same
+# pattern used by $DefaultIdentityProvider/$DefaultAuthenticationMode.
+if (-not (Get-Variable -Name 'DefaultExcludedGroupObjectIds' -Scope Script -ErrorAction SilentlyContinue)) {
+    $DefaultExcludedGroupObjectIds = @()
+}
 $missingConfigVars = $requiredConfigVars | Where-Object { -not (Get-Variable -Name $_ -Scope Script -ErrorAction SilentlyContinue) }
 if ($missingConfigVars) {
     throw "config.ps1 is missing required setting(s): $($missingConfigVars -join ', '). Compare your config.ps1 against the current config.sample.ps1 and add the missing value(s)."
@@ -996,7 +1018,12 @@ function Get-AccountStatusNote {
         # but zero owners of its own (nobody can manage its membership going
         # forward). A separate, lower-severity governance note appended
         # regardless of AccountStatus (Valid or EmptyGroup).
-        [switch]$GroupHasNoOwners
+        [switch]$GroupHasNoOwners,
+
+        # Set when this row's group is on the configured ExcludedGroupObjectIds
+        # list (config.ps1), so membership/ownership was intentionally never
+        # checked -- keeps the exclusion visible/auditable in the report.
+        [switch]$IsExcludedGroup
     )
 
     $note = ""
@@ -1028,7 +1055,10 @@ function Get-AccountStatusNote {
         }
     }
 
-    if ($GroupHasNoOwners) {
+    if ($IsExcludedGroup) {
+        $note = "This group is on the configured exclusion list (ExcludedGroupObjectIds in config.ps1) and was treated as valid without checking its membership/ownership."
+    }
+    elseif ($GroupHasNoOwners) {
         $governanceNote = "This group currently has zero owners of its own -- SharePoint access via its members still works today, but nobody can add/remove members going forward. Nominate at least one group owner to keep it maintainable."
         $note = if ([string]::IsNullOrWhiteSpace($note)) { $governanceNote } else { "$note $governanceNote" }
     }
@@ -1171,7 +1201,13 @@ function Add-OwnerResult {
         # can manage/update that group's membership going forward). This is
         # a lower-severity governance concern, distinct from AccountStatus
         # (which tracks whether the assignment currently grants real access).
-        [bool]$GroupOwnerGovernanceRisk = $false
+        [bool]$GroupOwnerGovernanceRisk = $false,
+
+        # True when this row's group is on the configured
+        # ExcludedGroupObjectIds list (config.ps1), so membership/ownership
+        # was intentionally skipped and this was treated as automatically
+        # valid. Kept visible in the report rather than silently hidden.
+        [bool]$GroupExcluded = $false
     )
 
     $script:OwnerResults.Add([pscustomobject]@{
@@ -1189,6 +1225,7 @@ function Add-OwnerResult {
         RiskFlag          = $RiskFlag
         Notes             = $Notes
         GroupOwnerGovernanceRisk = $GroupOwnerGovernanceRisk
+        GroupExcluded     = $GroupExcluded
     })
 }
 
@@ -1227,6 +1264,12 @@ function Add-SiteSummary {
     $deletedOwnerCount    = ($deletedOwners | Measure-Object).Count
     $unresolvedOwnerCount = ($unresolvedOwners | Measure-Object).Count
     $emptyGroupOwnerCount = ($emptyGroupOwners | Measure-Object).Count
+
+    # Informational only: groups matched by config.ps1's ExcludedGroupObjectIds
+    # list, whose membership/ownership was intentionally never checked and are
+    # counted as active owners above. Tracked separately purely for visibility
+    # in the summary tab; does not affect risk tiering.
+    $excludedGroupOwnerCount = (($SiteOwnerRows | Where-Object { $_.GroupExcluded -eq $true }) | Measure-Object).Count
 
     # Rows where the group has active members (access works) but zero
     # owners of its own (nobody can manage its membership going forward) --
@@ -1294,6 +1337,7 @@ function Add-SiteSummary {
         UnresolvedOwnerCount   = $unresolvedOwnerCount
         EmptyGroupOwnerCount   = $emptyGroupOwnerCount
         GroupOwnerGovernanceRiskCount = $groupOwnerGovernanceRiskCount
+        ExcludedGroupOwnerCount = $excludedGroupOwnerCount
         HasSingleOwnerRisk     = $hasSingleOwnerRisk
         HasNoActiveOwnersRisk  = $hasNoActiveOwnersRisk
         HasEmptyGroupRisk      = $hasEmptyGroupRisk
@@ -1402,6 +1446,17 @@ else {
     $effectiveIdentityProvider = $DefaultIdentityProvider
 }
 
+if ($PSBoundParameters.ContainsKey('ExcludedGroupObjectIds')) {
+    $effectiveExcludedGroupIds = $ExcludedGroupObjectIds
+}
+else {
+    $effectiveExcludedGroupIds = $DefaultExcludedGroupObjectIds
+}
+# Case-insensitive HashSet for fast, repeated membership lookups in the main loop.
+$excludedGroupIdSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]($effectiveExcludedGroupIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }),
+    [System.StringComparer]::OrdinalIgnoreCase)
+
 Write-Host "==============================================================" -ForegroundColor Cyan
 Write-Host " SharePoint Online Orphaned/Risky Owner Audit" -ForegroundColor Cyan
 Write-Host " Cloud Environment : $CloudEnvironment" -ForegroundColor Cyan
@@ -1495,6 +1550,7 @@ try {
                 $displayName = $null
                 $errorDetail = $null
                 $groupOwnerGovernanceRisk = $false
+                $groupExcluded = $false
 
                 if ($normalized.PrincipalType -in @("Member", "ExternalOrGuest") -and $normalized.UPN) {
                     if (-not $entraUserCache.ContainsKey($normalized.UPN)) {
@@ -1507,7 +1563,13 @@ try {
                     $errorDetail = $lookup.ErrorDetail
                 }
                 elseif ($normalized.PrincipalType -eq "GroupPrincipal") {
-                    if ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
+                    if ($normalized.GroupObjectId -and $excludedGroupIdSet.Contains($normalized.GroupObjectId)) {
+                        # On the configured exclusion list -- skip the Graph
+                        # membership/ownership check entirely and trust it.
+                        $status = "Valid"
+                        $groupExcluded = $true
+                    }
+                    elseif ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
                         $groupRole = if ($normalized.GroupRole) { $normalized.GroupRole } else { "Member" }
                         $groupCacheKey = "$($normalized.GroupObjectId)|$groupRole"
                         if (-not $groupStatusCache.ContainsKey($groupCacheKey)) {
@@ -1544,6 +1606,7 @@ try {
                     EntraObjectId     = $entraId
                     AccountStatus     = $status
                     GroupOwnerGovernanceRisk = $groupOwnerGovernanceRisk
+                    GroupExcluded     = $groupExcluded
                 }
 
                 Add-OwnerResult -SiteUrl $siteUrl -SiteTitle $site.Title -SiteTemplate $site.Template `
@@ -1551,8 +1614,8 @@ try {
                     -LoginName $ownerRow.LoginName -UserPrincipalName $ownerRow.UserPrincipalName `
                     -PrincipalType $ownerRow.PrincipalType -EntraObjectId $ownerRow.EntraObjectId `
                     -AccountStatus $ownerRow.AccountStatus -RiskFlag $riskFlag `
-                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk) `
-                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk
+                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk -IsExcludedGroup:$groupExcluded) `
+                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk -GroupExcluded $groupExcluded
 
                 $siteOwnerRows.Add($ownerRow)
             }
@@ -1572,6 +1635,7 @@ try {
                 $displayName = $admin.DisplayName
                 $errorDetail = $null
                 $groupOwnerGovernanceRisk = $false
+                $groupExcluded = $false
 
                 switch ($normalized.PrincipalType) {
                     { $_ -in @("Member", "ExternalOrGuest") } {
@@ -1590,7 +1654,13 @@ try {
                         }
                     }
                     "GroupPrincipal" {
-                        if ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
+                        if ($normalized.GroupObjectId -and $excludedGroupIdSet.Contains($normalized.GroupObjectId)) {
+                            # On the configured exclusion list -- skip the Graph
+                            # membership/ownership check entirely and trust it.
+                            $status = "Valid"
+                            $groupExcluded = $true
+                        }
+                        elseif ($normalized.GroupObjectId -and $effectiveIdentityProvider -eq "MicrosoftGraph") {
                             $groupRole = if ($normalized.GroupRole) { $normalized.GroupRole } else { "Member" }
                             $groupCacheKey = "$($normalized.GroupObjectId)|$groupRole"
                             if (-not $groupStatusCache.ContainsKey($groupCacheKey)) {
@@ -1610,7 +1680,10 @@ try {
                 }
 
                 $riskFlag = ""
-                if ($normalized.PrincipalType -eq "GroupPrincipal") {
+                if ($groupExcluded) {
+                    # Explicitly trusted via configuration -- no risk flag.
+                }
+                elseif ($normalized.PrincipalType -eq "GroupPrincipal") {
                     switch ($status) {
                         "EmptyGroup"       { $riskFlag = "EmptyGroupAdmin" }
                         "DeletedFromEntra" { $riskFlag = "OrphanedSiteAdmin" }
@@ -1629,6 +1702,7 @@ try {
                     EntraObjectId     = $entraId
                     AccountStatus     = $status
                     GroupOwnerGovernanceRisk = $groupOwnerGovernanceRisk
+                    GroupExcluded     = $groupExcluded
                 }
 
                 Add-OwnerResult -SiteUrl $siteUrl -SiteTitle $site.Title -SiteTemplate $site.Template `
@@ -1636,8 +1710,8 @@ try {
                     -LoginName $ownerRow.LoginName -UserPrincipalName $ownerRow.UserPrincipalName `
                     -PrincipalType $ownerRow.PrincipalType -EntraObjectId $ownerRow.EntraObjectId `
                     -AccountStatus $ownerRow.AccountStatus -RiskFlag $riskFlag `
-                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk) `
-                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk
+                    -Notes (Get-AccountStatusNote -AccountStatus $ownerRow.AccountStatus -ErrorDetail $errorDetail -IsGroupPrincipal:($ownerRow.PrincipalType -eq "GroupPrincipal") -GroupHasNoOwners:$groupOwnerGovernanceRisk -IsExcludedGroup:$groupExcluded) `
+                    -GroupOwnerGovernanceRisk $groupOwnerGovernanceRisk -GroupExcluded $groupExcluded
 
                 $siteOwnerRows.Add($ownerRow)
             }
@@ -1745,6 +1819,10 @@ try {
     Write-Host " Risk - Low             : $lowCount"
     if ($unknownCount -gt 0) {
         Write-Host " Risk - Unknown         : $unknownCount (owner status could not be fully verified - see below)"
+    }
+    if ($excludedGroupIdSet.Count -gt 0) {
+        $totalExcludedRows = ($script:OwnerResults | Where-Object { $_.GroupExcluded -eq $true } | Measure-Object).Count
+        Write-Host " Excluded group rows    : $totalExcludedRows (matched ExcludedGroupObjectIds in config.ps1; membership/ownership not checked)"
     }
     if ($script:SiteCollectionAdminAccessDeniedSites.Count -gt 0) {
         Write-Host ""

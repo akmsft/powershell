@@ -167,6 +167,38 @@ per-run with `-IdentityProvider`:
   group owner data will always be incomplete, and mailbox-less accounts will
   be misclassified as deleted.
 
+## Excluding groups from membership/ownership checks
+
+Some organizations have one or more "everyone" style security or Microsoft
+365 groups (e.g., "All Employees", "All Staff") assigned as a site owner or
+Site Collection Administrator. These groups are typically huge, always have
+active members, and checking them wastes time/API calls on every run for a
+result that's already known in advance.
+
+To skip a group entirely, list its Entra ID **Object ID** (GUID) in
+`$DefaultExcludedGroupObjectIds` in `config.ps1`:
+
+```powershell
+$DefaultExcludedGroupObjectIds = @(
+    "11111111-1111-1111-1111-111111111111"   # e.g., "All Employees"
+)
+```
+
+You can also override this at runtime without editing `config.ps1`, using
+the `-ExcludedGroupObjectIds` parameter:
+
+```powershell
+.\Get-SPOOrphanedOwnerAudit.ps1 -ExcludedGroupObjectIds "11111111-1111-1111-1111-111111111111" -Verbose
+```
+
+A group matched by this list is treated as `Valid` (an active owner) without
+calling Microsoft Graph to check its membership or ownership — but it still
+appears in the **Detail** report tab, with a note explaining it was excluded
+via configuration and a `GroupExcluded` column set to `True`, so the
+exclusion stays visible/auditable rather than silently hidden. Find a
+group's Object ID in the Entra admin center (**Groups** → select the group →
+**Object ID**), or via `Get-MgGroup -Filter "DisplayName eq 'All Employees'"`.
+
 ## Authentication modes
 
 - **`Interactive`** (default) — an admin signs in via browser prompt. Best
