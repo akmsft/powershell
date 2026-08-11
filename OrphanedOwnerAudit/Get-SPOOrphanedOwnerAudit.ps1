@@ -165,8 +165,8 @@ param(
     [ValidateSet("MicrosoftGraph", "ExchangeOnline")]
     [string]$IdentityProvider,
 
-    # Overrides $ExcludedGroupObjectIds from config.ps1, if supplied. One or
-    # more Entra ID group Object IDs (GUIDs) to treat as automatically valid
+    # Overrides $DefaultExcludedGroupObjectIds from config.ps1, if supplied. One
+        # or more Entra ID group Object IDs (GUIDs) to treat as automatically valid
     # without checking membership/ownership -- useful for "All Employees"
     # style groups. See config.sample.ps1 for details.
     [string[]]$ExcludedGroupObjectIds,
@@ -1056,7 +1056,7 @@ function Get-AccountStatusNote {
     }
 
     if ($IsExcludedGroup) {
-        $note = "This group is on the configured exclusion list (ExcludedGroupObjectIds in config.ps1) and was treated as valid without checking its membership/ownership."
+        $note = "This group is on the configured exclusion list (DefaultExcludedGroupObjectIds in config.ps1, or -ExcludedGroupObjectIds at runtime) and was treated as valid without checking its membership/ownership."
     }
     elseif ($GroupHasNoOwners) {
         $governanceNote = "This group currently has zero owners of its own -- SharePoint access via its members still works today, but nobody can add/remove members going forward. Nominate at least one group owner to keep it maintainable."
@@ -1822,7 +1822,7 @@ try {
     }
     if ($excludedGroupIdSet.Count -gt 0) {
         $totalExcludedRows = ($script:OwnerResults | Where-Object { $_.GroupExcluded -eq $true } | Measure-Object).Count
-        Write-Host " Excluded group rows    : $totalExcludedRows (matched ExcludedGroupObjectIds in config.ps1; membership/ownership not checked)"
+        Write-Host " Excluded group rows    : $totalExcludedRows (matched DefaultExcludedGroupObjectIds/-ExcludedGroupObjectIds; membership/ownership not checked)"
     }
     if ($script:SiteCollectionAdminAccessDeniedSites.Count -gt 0) {
         Write-Host ""
