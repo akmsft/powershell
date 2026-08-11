@@ -61,6 +61,15 @@ Each run produces a single timestamped `.xlsx` workbook in `AuditReports/`
 - **OrphanedOwners** — every owner that is `DeletedFromEntra` or `Unresolved`, for quick triage
 - **Errors** — any per-site processing errors encountered (the audit continues past individual site failures)
 
+Every run also writes a full **transcript log** (`.xlsx` alongside a matching
+`.log` file, same timestamp — e.g. `SPOOwnerAudit_20260810_080308.log`) to
+the same output folder. This captures the entire console output of the run,
+including any errors or warnings, and exists so an unattended/scheduled run
+that fails overnight can still be diagnosed after the fact (see
+[Authentication modes](#authentication-modes)). If the log file itself can't
+be created (e.g., read-only folder), the audit still runs — you'll get a
+`Could not start a transcript log` warning instead of a hard failure.
+
 A summary is also printed to the console at the end of each run, e.g.:
 
 ```
@@ -209,10 +218,28 @@ group's Object ID in the Entra admin center (**Groups** → select the group →
   values in `config.ps1`, or pass `-AuthenticationMode AppOnly` at runtime.
 
   > ⚠️ **This path has not yet been validated in a live unattended run by this
-  > project's author.** The code has been carefully reviewed, but if you rely
-  > on it for scheduled execution, test thoroughly in a non-production tenant
-  > first. Contributions/confirmations from real-world testing are welcome —
-  > see [Contributing](#contributing).
+  > project's author.** Every piece of it has been carefully reviewed and the
+  > individual building blocks (certificate auth, Graph/PnP connections) use
+  > well-documented Microsoft cmdlets, but the full end-to-end AppOnly +
+  > Task Scheduler flow — run unattended, start to finish, on a real schedule
+  > — has not been personally observed to succeed. **Before pointing this at
+  > production:**
+  > 1. Register the scheduled task (see below), then **right-click it in Task
+  >    Scheduler and choose "Run" manually** at least once. Confirm it
+  >    completes, produces a `.xlsx` report *and* a `.log` transcript in
+  >    `AuditReports/`, and that the row/risk counts look sane compared to an
+  >    interactive run against the same tenant.
+  > 2. Only after that manual run succeeds, let it run on its actual nightly
+  >    schedule for a few cycles before relying on it unattended long-term.
+  > 3. If the manual run fails, **read the `.log` transcript first** — it
+  >    captures the exact error, not just Task Scheduler's generic exit code.
+  >    Common first-run failures: the run-as account can't read the
+  >    certificate's private key, the app registration is missing
+  >    admin-consented permissions, or required PowerShell modules aren't
+  >    installed/visible to that account.
+  >
+  > Contributions/confirmations from real-world testing are welcome — see
+  > [Contributing](#contributing).
 
   **`Register-SPOOrphanedOwnerAuditTask.ps1` is a separate, optional helper
   script included in this folder.** It does **not** run the audit itself —
@@ -276,7 +303,16 @@ group's Object ID in the Entra admin center (**Groups** → select the group →
   risk flag) and does not affect the primary `AccountStatus`/`EmptyGroup`
   determination above.
 - **AppOnly/unattended mode is untested by the author** in a live scheduled
-  run — see the warning under [Authentication modes](#authentication-modes).
+  run — see the warning under [Authentication modes](#authentication-modes)
+  for the recommended manual "Run" verification step before trusting the
+  nightly schedule.
+- **`-OutputFolder` must be writable by the scheduled task's run-as account**
+  (SYSTEM or a service account), not just by you interactively. The default
+  (`AuditReports` next to the script) is usually fine, but if you point
+  `-OutputFolder` at a network share or a path under another user's profile,
+  confirm that account actually has write access — a permissions error here
+  will prevent both the `.xlsx` report *and* the `.log` transcript from being
+  written, so you may only see it via Task Scheduler's exit code.
 
 ## Repository layout
 

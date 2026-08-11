@@ -1380,7 +1380,13 @@ function Add-ErrorRecord {
 function Export-AuditReports {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$OutputFolder
+        [Parameter(Mandatory)][string]$OutputFolder,
+
+        # Shared with the transcript log filename (set once in the MAIN
+        # region) so a report workbook and its corresponding run log are easy
+        # to match up by filename. Falls back to "now" if not supplied, so
+        # this function still works if ever called standalone/interactively.
+        [string]$Timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
     )
 
     if (-not (Test-Path -Path $OutputFolder)) {
@@ -1389,7 +1395,7 @@ function Export-AuditReports {
 
     Import-Module ImportExcel -ErrorAction Stop
 
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $timestamp = $Timestamp
     $workbookPath = Join-Path $OutputFolder "SPOOwnerAudit_$timestamp.xlsx"
 
     # Remove any stale file of the same name (shouldn't normally exist, given
@@ -1464,6 +1470,29 @@ Write-Host " Tenant            : $TenantName" -ForegroundColor Cyan
 Write-Host " Auth Mode         : $effectiveAuthMode" -ForegroundColor Cyan
 Write-Host " Identity Provider : $effectiveIdentityProvider" -ForegroundColor Cyan
 Write-Host "==============================================================" -ForegroundColor Cyan
+
+# WHY: For an interactive run, a failure is visible on-screen immediately.
+# For an unattended/scheduled (AppOnly) run, nobody is watching -- Windows
+# Task Scheduler's "Last Run Result" only shows a generic exit code, not the
+# actual error message, and this script otherwise has no output at all
+# besides the .xlsx report (which won't even exist if the run fails before
+# reaching Export-AuditReports). A full transcript log, written every run
+# regardless of mode, is the only way to diagnose a failed unattended run
+# after the fact. Best-effort: a transcript failure (e.g., read-only folder)
+# must never block the actual audit from running.
+$script:RunTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$transcriptStarted = $false
+try {
+    if (-not (Test-Path -Path $OutputFolder)) {
+        New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+    }
+    $script:TranscriptPath = Join-Path $OutputFolder "SPOOwnerAudit_$($script:RunTimestamp).log"
+    Start-Transcript -Path $script:TranscriptPath -ErrorAction Stop | Out-Null
+    $transcriptStarted = $true
+}
+catch {
+    Write-Warning "Could not start a transcript log ($($_.Exception.Message)). Continuing without one -- console output will not be saved for this run."
+}
 
 try {
     if ($effectiveAuthMode -eq "AppOnly") {
@@ -1797,7 +1826,7 @@ try {
     Write-Progress -Activity "Auditing SharePoint Online site ownership" -Completed
 
     # ---- Export reports ----
-    $paths = Export-AuditReports -OutputFolder $OutputFolder
+    $paths = Export-AuditReports -OutputFolder $OutputFolder -Timestamp $script:RunTimestamp
 
     # ---- Console summary ----
     $criticalCount = ($script:SiteSummaries | Where-Object { $_.OverallRiskLevel -eq "Critical" } | Measure-Object).Count
@@ -1841,6 +1870,9 @@ try {
     }
     Write-Host ""
     Write-Host " Report workbook        : $($paths.WorkbookPath)"
+    if ($transcriptStarted) {
+        Write-Host " Run log                : $script:TranscriptPath"
+    }
     Write-Host "==============================================================" -ForegroundColor Green
 }
 catch {
@@ -1852,5 +1884,10 @@ finally {
     try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch { }
     try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch { }
     try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    # Stop the transcript last, so it also captures the disconnect attempts
+    # and (if the run failed) the "Audit failed:" error message above.
+    if ($transcriptStarted) {
+        try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
+    }
 }
 #endregion =========================== MAIN ================================
