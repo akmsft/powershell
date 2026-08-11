@@ -1,0 +1,11 @@
+# Tenant-specific configuration -- never commit your real settings.
+# Copy config.sample.ps1 to config.ps1 and edit config.ps1 locally instead.
+config.ps1
+
+# Generated audit reports (contain tenant ownership/identity data).
+AuditReports/
+
+# Common PowerShell/Windows noise
+*.log
+Thumbs.db
+desktop.ini
