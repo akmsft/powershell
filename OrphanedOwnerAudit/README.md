@@ -35,18 +35,19 @@ Each identity found is checked against Entra ID and classified as:
 
 | Status | Meaning |
 |---|---|
-| `Valid` | Account exists and is active |
-| `DeletedFromEntra` | Account no longer exists (or has no mailbox, in ExchangeOnline mode) |
-| `Unresolved` | Lookup could not be completed (e.g., malformed login, unsupported principal type) — see the row's Notes column for the real underlying error |
+| `Valid` | Account exists and is active (or, for a group-principal owner/admin, the group exists and has at least one active member) |
+| `DeletedFromEntra` | Account no longer exists (or has no mailbox, in ExchangeOnline mode); or, for a group principal, the group itself no longer exists in Entra ID |
+| `EmptyGroup` | Owner/admin is a security or Microsoft 365 group that still exists, but currently has **zero active members** — so no one can actually act as owner through this assignment |
+| `Unresolved` | Lookup could not be completed (e.g., malformed login, unsupported principal type, group membership couldn't be verified) — see the row's Notes column for the real underlying error |
 | `Unknown` | Site collection admin data unavailable for this specific site (see [Known limitations](#known-limitations)) |
 
 Each site is then assigned an overall risk tier:
 
 | Risk | Meaning |
 |---|---|
-| **Critical** | Site has zero valid/active owners |
-| **High** | Group-connected site has no valid group owners |
-| **Medium** | Site has only a single active owner (single point of failure), a group-principal admin, or a deleted/unresolved owner |
+| **Critical** | Site has zero valid/active owners (including when the only owner is an empty group) |
+| **High** | Group-connected site has no valid group owners; or another owner exists, but a group-principal owner/admin has zero active members |
+| **Medium** | Site has only a single active owner (single point of failure), an unverifiable group-principal admin, or a deleted/unresolved owner |
 | **Low** | No issues found |
 | **Unknown** | Site has zero *confirmed* active owners, but site collection admin data couldn't be checked for this site (may have unseen admins) — see limitation below |
 
@@ -221,6 +222,19 @@ per-run with `-IdentityProvider`:
   "sees" mail-enabled recipients. A valid Entra ID account with no
   mailbox/license (e.g., an unlicensed guest) will not be found and will be
   misclassified as `DeletedFromEntra`, even though it still exists.
+- **Group-principal membership check only covers real, queryable Entra ID
+  groups.** When a site's `Owner` property or a Site Collection Admin is a
+  group, the script resolves the group's Entra Object ID from the claim and
+  checks (via Microsoft Graph) whether it has any active members — flagging
+  a genuinely empty group as `EmptyGroup` instead of blindly trusting it as
+  `Valid`. This only works for the group-claim format that actually encodes
+  a queryable group GUID. Two rarer claim types cannot be resolved this way
+  and remain unverified (treated as `Valid`, same as before this check
+  existed): the tenant-wide "Everyone"/"Everyone except external users"
+  claim, and SharePoint's own built-in permission-level groups (e.g. Limited
+  Access System Group). This check also requires `MicrosoftGraph` identity
+  provider mode; in `ExchangeOnline` mode, group-principal owners/admins are
+  not verified at all and remain unverified/`Valid`.
 - **AppOnly/unattended mode is untested by the author** in a live scheduled
   run — see the warning under [Authentication modes](#authentication-modes).
 
