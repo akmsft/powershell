@@ -70,6 +70,13 @@ that fails overnight can still be diagnosed after the fact (see
 be created (e.g., read-only folder), the audit still runs — you'll get a
 `Could not start a transcript log` warning instead of a hard failure.
 
+> **Both the `.xlsx` report and `.log` transcript contain tenant identity
+> data** (display names, UPNs, site URLs, Entra Object IDs). They're
+> gitignored so they're never committed to this repo, but treat the
+> `AuditReports/` folder itself the same way you'd treat any other export of
+> user/directory data — store and share it per your organization's normal
+> data-handling policy.
+
 A summary is also printed to the console at the end of each run, e.g.:
 
 ```
@@ -313,6 +320,18 @@ group's Object ID in the Entra admin center (**Groups** → select the group →
   confirm that account actually has write access — a permissions error here
   will prevent both the `.xlsx` report *and* the `.log` transcript from being
   written, so you may only see it via Task Scheduler's exit code.
+- **No certificate-expiration reminder for `AppOnly` mode.** The script does
+  not check or warn about the AppOnly certificate's expiry date — if it
+  silently expires, the scheduled run will simply start failing with an
+  authentication error. Track the certificate's expiration separately (e.g.,
+  a calendar reminder or your normal cert-renewal process) rather than
+  relying on this tool to notice.
+- **`Save-Module` (used by `-InstallMissingModules`) installs the latest
+  available module version, unpinned.** A future breaking change in
+  `PnP.PowerShell` or the `Microsoft.Graph.*` modules could affect this
+  script's behavior on a fresh install without warning. For production use,
+  consider pinning to specific, tested module versions (`Save-Module -Name
+  ... -RequiredVersion ...`) rather than always installing latest.
 
 ## Repository layout
 
